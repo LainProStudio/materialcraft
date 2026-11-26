@@ -346,7 +346,7 @@ impl Builder {
 impl FastProgram {
     /// Compile `program` into a scalarized 8-wide SOA packet program if every instruction is a pure
     /// pixel-processor op with static types and no loops/calls/conditional side effects.
-    pub(crate) fn try_compile(program: &Program, vars: &BTreeMap<String, Value>, size: [f32; 2]) -> Option<Self> {
+    pub(crate) fn try_compile(program: &Program, vars: &BTreeMap<String, Value>, size: [f32; 2], tile: bool) -> Option<Self> {
         let len = program.instructions.len();
         if len == 0 || len > usize::from(u16::MAX) {
             return None;
@@ -360,7 +360,7 @@ impl FastProgram {
         let pos_ref = RegRef { kind: RegKind::Float, dims: 2, slots: [pos_x, pos_y, 0, 0] };
         let zero_f = b.alloc_f_const(0.0)?;
 
-        let dummy_ctx = EvaluationContext { scope: FunctionScope::PixelProcessor, position: [0.0, 0.0], size, images: &[], tile: true, variables: vars };
+        let dummy_ctx = EvaluationContext { scope: FunctionScope::PixelProcessor, position: [0.0, 0.0], size, images: &[], tile, variables: vars };
 
         for (idx, inst) in program.instructions.iter().enumerate() {
             if inst.call.is_some() {
@@ -424,11 +424,20 @@ impl FastProgram {
                         }
                         let val = match vars.get(name.as_str()).cloned() {
                             Some(v) => v,
-                            None => materialcraft_core::ValueType::from_code(inst.type_code)
-                                .filter(|k| *k != materialcraft_core::ValueType::String)?
-                                .default_value(),
+                            None => {
+                                if name.starts_with('$') {
+                                    return None;
+                                }
+                                materialcraft_core::ValueType::from_code(inst.type_code)
+                                    .filter(|k| *k != materialcraft_core::ValueType::String)?
+                                    .default_value()
+                            }
                         };
-                        let val = if op == "get_bool" && matches!(val, Value::Int(_) | Value::Enum(_)) { Value::Bool(val.as_i32()? != 0) } else { val };
+                        let val = if op == "get_bool" && !name.starts_with('$') && matches!(val, Value::Int(_) | Value::Enum(_)) {
+                            Value::Bool(val.as_i32()? != 0)
+                        } else {
+                            val
+                        };
                         if super::value_type::type_code(&val) != inst.type_code {
                             return None;
                         }
@@ -845,6 +854,9 @@ impl FastProgram {
         }
 
         let output = *refs.get(program.output)?;
+        if output.kind != RegKind::Float {
+            return None;
+        }
         let expected_type = program.instructions.get(program.output)?.type_code;
         if reg_type_code(output.kind, output.dims) != expected_type {
             return None;
@@ -1619,7 +1631,7 @@ fn trig_simd8(va: [f32; PACKET], quad_offset: i32) -> [f32; PACKET] {
 
 fn reg_type_code(kind: RegKind, dims: u8) -> u32 {
     match (kind, dims) {
-        (RegKind::Bool, _) => 1,
+        (RegKind::Bool, _) => materialcraft_core::ValueType::Boolean as u32,
         (RegKind::Int, 1) => 16,
         (RegKind::Int, 2) => 32,
         (RegKind::Int, 3) => 64,
@@ -1706,7 +1718,7 @@ mod tests {
         };
         let program = compile(&graph, 0).expect("compile");
         let vars = BTreeMap::new();
-        let fast = FastProgram::try_compile(&program, &vars, [64.0, 64.0]).expect("fast program");
+        let fast = FastProgram::try_compile(&program, &vars, [64.0, 64.0], true).expect("fast program");
         let mut regs = fast.new_regs();
         let mut state = EvaluationState::default();
         for chunk in 0..2 {
@@ -1748,5 +1760,88 @@ mod tests {
             }
         }
         assert!(max_err < 1e-6, "simd8 trig max error too large: {max_err}");
+    }
+
+    #[test]
+    fn fast_compiler_respects_tile_system_vars_bool_and_float_output_contract() {
+        let vars = BTreeMap::new();
+
+        // 1. `$tiling` reflects `tile: false` (0) vs `tile: true` (3).
+        let tiling_graph = FunctionGraph {
+            nodes: vec![
+                n(1, "get_integer1", &[], Some(Value::Text("$tiling".into()))),
+                n(2, "const_int1", &[], Some(Value::Int(0))),
+                n(3, "eq", &[1, 2], None),
+                n(4, "const_float1", &[], Some(Value::Float(1.0))),
+                n(5, "const_float1", &[], Some(Value::Float(0.25))),
+                n(6, "ifelse", &[3, 4, 5], None),
+            ],
+            output: Some(6),
+            ..FunctionGraph::default()
+        };
+        let tiling_prog = compile(&tiling_graph, 0).expect("compile");
+        let pctx = PacketCtx { images: &[], tile: false, gray: true, format: OutputFormat::F32, channels: 1 };
+        let fast_off = FastProgram::try_compile(&tiling_prog, &vars, [8.0, 8.0], false).expect("tile=false");
+        let mut out_off = [0.0f32; 1];
+        fast_off.eval_packet(&mut fast_off.new_regs(), [0.5; PACKET], 0.5, &pctx, 1, &mut out_off).expect("eval");
+        assert_eq!(out_off[0], 1.0);
+
+        let fast_on = FastProgram::try_compile(&tiling_prog, &vars, [8.0, 8.0], true).expect("tile=true");
+        let mut out_on = [0.0f32; 1];
+        fast_on.eval_packet(&mut fast_on.new_regs(), [0.5; PACKET], 0.5, &pctx, 1, &mut out_on).expect("eval");
+        assert_eq!(out_on[0], 0.25);
+
+        // 2. Missing `$`-prefixed variable declines fast compilation so interpreter errors.
+        let missing_sys =
+            FunctionGraph { nodes: vec![n(1, "get_float1", &[], Some(Value::Text("$missing".into())))], output: Some(1), ..FunctionGraph::default() };
+        let missing_prog = compile(&missing_sys, 0).expect("compile");
+        assert!(FastProgram::try_compile(&missing_prog, &vars, [8.0, 8.0], true).is_none());
+
+        // 3. `get_bool` coerces Int for user vars, but NOT for `$`-prefixed vars.
+        let bool_coerce = |name: &str| FunctionGraph {
+            nodes: vec![
+                n(1, "get_bool", &[], Some(Value::Text(name.into()))),
+                n(2, "const_float1", &[], Some(Value::Float(1.0))),
+                n(3, "const_float1", &[], Some(Value::Float(0.0))),
+                n(4, "ifelse", &[1, 2, 3], None),
+            ],
+            output: Some(4),
+            ..FunctionGraph::default()
+        };
+        let mut custom_vars = BTreeMap::new();
+        custom_vars.insert("$custom".to_string(), Value::Int(7));
+        custom_vars.insert("enabled".to_string(), Value::Int(7));
+        let sys_bool_prog = compile(&bool_coerce("$custom"), 0).expect("compile");
+        assert!(FastProgram::try_compile(&sys_bool_prog, &custom_vars, [8.0, 8.0], true).is_none());
+        let user_bool_prog = compile(&bool_coerce("enabled"), 0).expect("compile");
+        let fast_user = FastProgram::try_compile(&user_bool_prog, &custom_vars, [8.0, 8.0], true).expect("user int->bool");
+        let mut out_user = [0.0f32; 1];
+        fast_user.eval_packet(&mut fast_user.new_regs(), [0.5; PACKET], 0.5, &pctx, 1, &mut out_user).expect("eval");
+        assert_eq!(out_user[0], 1.0);
+
+        // 4. Non-float final output declines fast compilation.
+        let int_out = FunctionGraph { nodes: vec![n(1, "const_int1", &[], Some(Value::Int(1)))], output: Some(1), ..FunctionGraph::default() };
+        let int_prog = compile(&int_out, 0).expect("compile");
+        assert!(FastProgram::try_compile(&int_prog, &vars, [8.0, 8.0], true).is_none());
+
+        // 5. Hoisted `set` + `get_bool` compiles cleanly using ValueType::Boolean (4).
+        let set_bool = FunctionGraph {
+            nodes: vec![
+                n(1, "const_bool", &[], Some(Value::Bool(true))),
+                n(2, "set", &[1], Some(Value::Text("flag".into()))),
+                n(3, "get_bool", &[], Some(Value::Text("flag".into()))),
+                n(4, "const_float1", &[], Some(Value::Float(0.75))),
+                n(5, "const_float1", &[], Some(Value::Float(0.25))),
+                n(6, "ifelse", &[3, 4, 5], None),
+                n(7, "sequence", &[2, 6], None),
+            ],
+            output: Some(7),
+            ..FunctionGraph::default()
+        };
+        let set_bool_prog = compile(&set_bool, 0).expect("compile");
+        let fast_bool = FastProgram::try_compile(&set_bool_prog, &vars, [8.0, 8.0], true).expect("set+get_bool compiles");
+        let mut out_bool = [0.0f32; 1];
+        fast_bool.eval_packet(&mut fast_bool.new_regs(), [0.5; PACKET], 0.5, &pctx, 1, &mut out_bool).expect("eval");
+        assert_eq!(out_bool[0], 0.75);
     }
 }
