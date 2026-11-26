@@ -174,4 +174,38 @@ mod end_merge_tests {
         assert!(h.render_png_with_cancel(&opts_2d, Some(&cancelled)).is_err());
         assert!(h.render_png_with_cancel(&opts_3d, Some(&cancelled)).is_err());
     }
+
+    #[test]
+    fn export_does_not_mark_partial_cache_complete_for_disconnected_3d_channel_and_reports_encoded_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Headless::new(materialcraft_engine::new_session(), Filesystem::TrustedLocal);
+        let u_out = h.command_run("graph.node.add", json!({"def": "uniform", "params": {"color": [0.0, 0.0, 0.0, 1.0]}})).unwrap()["id"].as_u64().unwrap();
+        let out = h.command_run("graph.node.add", json!({"def": "output", "params": {"usage": 0}})).unwrap()["id"].as_u64().unwrap();
+        h.command_run("graph.connect", json!({"from": u_out, "to": out})).unwrap();
+
+        // Add a disconnected red uniform node and assign it as 3D baseColor.
+        let disconnected =
+            h.command_run("graph.node.add", json!({"def": "uniform", "params": {"color": [1.0, 0.1, 0.1, 1.0]}})).unwrap()["id"].as_u64().unwrap();
+
+        let opts = RenderOptions { view: Some("3d".into()), width: Some(32), height: Some(32), full: true, ..RenderOptions::default() };
+        let dark_png = h.render_png(&opts).unwrap().png;
+
+        h.command_run("view.3d.assign", json!({"node": disconnected, "channel": "baseColor"})).unwrap();
+        // Export populates output-rooted full_cache; it must NOT mark the cache complete.
+        let jpg_dir = dir.path().join("jpg");
+        let jpg_report = h.export(&json!({"dir": jpg_dir.to_str().unwrap(), "format": "jpg", "depth": 16})).unwrap();
+        assert_eq!(jpg_report["details"][0]["depth"], json!(8), "JPEG always encodes 8-bit samples");
+
+        let exr_dir = dir.path().join("exr");
+        let exr_report = h.export(&json!({"dir": exr_dir.to_str().unwrap(), "format": "exr", "depth": 8})).unwrap();
+        assert_eq!(exr_report["details"][0]["depth"], json!(32), "EXR always encodes 32-bit float samples");
+
+        let png_dir = dir.path().join("png");
+        let png_report = h.export(&json!({"dir": png_dir.to_str().unwrap(), "format": "png", "depth": 32})).unwrap();
+        assert_eq!(png_report["details"][0]["depth"], json!(16), "PNG clamps non-U8 requests to 16-bit");
+
+        // Full 3D render after export must still cook the disconnected assigned channel.
+        let after_export_png = h.render_png(&opts).unwrap().png;
+        assert_ne!(after_export_png, dark_png, "disconnected 3D channel must not be dropped by export-populated cache");
+    }
 }

@@ -369,6 +369,15 @@ pub fn export_outputs(s: &Session, request: &ExportRequest) -> Result<Vec<Export
     encode_outputs(s.pkg.graph(request.graph)?, &cooked, request)
 }
 
+/// Effective sample bit depth written by `materialcraft_formats::encode` for `(format, depth)`.
+fn encoded_bits(format: &str, depth: Depth) -> u8 {
+    match format.trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "exr" | "hdr" => 32,
+        "png" if depth != Depth::U8 => 16,
+        _ => 8,
+    }
+}
+
 pub(crate) fn encode_outputs(graph: &materialcraft_core::Graph, cooked: &materialcraft_eval::Cooked, request: &ExportRequest) -> Result<Vec<Exported>> {
     Ok(encode_outputs_with_details(graph, cooked, request)?.0)
 }
@@ -420,11 +429,7 @@ pub(crate) fn encode_outputs_with_details(
         .par_iter()
         .map(|job| {
             let bytes = encode(job.image, &request.format, job.depth, job.srgb)?;
-            let bits = match job.depth {
-                Depth::U8 => 8,
-                Depth::U16 => 16,
-                Depth::F32 => 32,
-            };
+            let bits = encoded_bits(&request.format, job.depth);
             let detail = json!({
                 "file": job.file,
                 "identifier": job.identifier,

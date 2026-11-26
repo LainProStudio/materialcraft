@@ -179,9 +179,16 @@ fn image_stats(image: &craft_texture::Image) -> Option<J> {
             by += px_diff(x, last_row + x);
             iy += px_diff(mid_a + x, mid_b + x);
         }
-        let rx = if ix > 1e-6 { bx / ix } else { 1.0 };
-        let ry = if iy > 1e-6 { by / iy } else { 1.0 };
-        (Some(rx), Some(ry))
+        let seam_ratio = |border: f64, interior: f64| -> Option<f64> {
+            if interior > 1e-6 {
+                Some(border / interior)
+            } else if border <= 1e-6 {
+                Some(1.0)
+            } else {
+                None
+            }
+        };
+        (seam_ratio(bx, ix), seam_ratio(by, iy))
     } else {
         (None, None)
     };
@@ -196,4 +203,28 @@ fn image_stats(image: &craft_texture::Image) -> Option<J> {
         "seamX": seam_x,
         "seamY": seam_y,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_stats;
+    use craft_texture::{Image, Kind, Limits};
+
+    #[test]
+    fn seam_ratio_distinguishes_constant_image_from_flat_interior_edge_discontinuity() {
+        let flat = Image::from_data(4, 4, Kind::Gray, vec![0.5; 16], &Limits::default()).unwrap();
+        let flat_stats = image_stats(&flat).unwrap();
+        assert_eq!(flat_stats["seamX"].as_f64(), Some(1.0));
+        assert_eq!(flat_stats["seamY"].as_f64(), Some(1.0));
+
+        // Each row is [0, 0, 0, 1]: interior diff ix == 0, border wrap diff bx > 0.
+        let mut step_data = Vec::with_capacity(16);
+        for _ in 0..4 {
+            step_data.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+        }
+        let step = Image::from_data(4, 4, Kind::Gray, step_data, &Limits::default()).unwrap();
+        let step_stats = image_stats(&step).unwrap();
+        assert!(step_stats["seamX"].is_null(), "edge discontinuity with flat interior must not report 1.0: {step_stats}");
+        assert_eq!(step_stats["seamY"].as_f64(), Some(1.0));
+    }
 }
