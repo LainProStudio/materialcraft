@@ -18,8 +18,10 @@ pub use crate::{Filesystem, RenderOptions, Rendered};
 const MAX_EXPORTED_MATERIAL_BYTES: u64 = 256 << 20;
 
 struct FullCache {
+    document_id: u64,
     graph: usize,
-    revision: u64,
+    session_revision: u64,
+    headless_revision: u64,
     complete: bool,
     cooked: materialcraft_engine::eval::Cooked,
 }
@@ -81,6 +83,15 @@ impl Headless {
     fn invalidate_full_cache(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.full_cache = None;
+    }
+
+    fn full_cache_matches(&self, graph: usize) -> bool {
+        self.full_cache.as_ref().is_some_and(|c| {
+            c.document_id == self.session.document_id
+                && c.graph == graph
+                && c.session_revision == self.session.content_revision
+                && c.headless_revision == self.revision
+        })
     }
 
     /// The session a fresh server starts with: the atomic sample
@@ -166,6 +177,7 @@ impl Headless {
         let document = self.session.open_packages().into_iter().find(|entry| entry.2 == Some(path)).map(|entry| entry.0);
         if let Some(document) = document {
             self.session.activate_document(document)?;
+            self.invalidate_full_cache();
             return Ok(());
         }
 
@@ -337,7 +349,7 @@ impl Headless {
             .or_else(|| self.session.selection.last().copied())
             .or_else(|| g.nodes.iter().find(|n| n.def == "output").map(|n| n.id))
             .ok_or_else(|| bad("nothing to show: the graph has no outputs; pass `node`"))?;
-        let port = if Some(id) == self.session.view2d.node { self.session.view2d.port } else { 0 };
+        let port = options.port.unwrap_or_else(|| if Some(id) == self.session.view2d.node { self.session.view2d.port } else { 0 });
         Ok((id, port))
     }
 
@@ -348,21 +360,23 @@ impl Headless {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(u32, u32, Vec<u8>), AutomationError> {
         let (target_id, port) = self.resolve_2d_target(options)?;
+        let doc_id = self.session.document_id;
         let graph = self.session.graph;
+        let s_rev = self.session.content_revision;
         let rev = self.revision;
-        let cached_hit = self.full_cache.as_ref().is_some_and(|c| c.graph == graph && c.revision == rev && c.cooked.image(target_id, port).is_some());
+        let cached_hit = self.full_cache_matches(graph) && self.full_cache.as_ref().is_some_and(|c| c.cooked.image(target_id, port).is_some());
         if !cached_hit {
             let partial = self.session.cook_full_with(graph, Some(vec![target_id]), cancel);
             if partial.cancelled {
                 return Err(AutomationError::Other("render cancelled".into()));
             }
-            match &mut self.full_cache {
-                Some(entry) if entry.graph == graph && entry.revision == rev => {
-                    entry.cooked.nodes.extend(partial.nodes);
-                }
-                slot => {
-                    *slot = Some(FullCache { graph, revision: rev, complete: false, cooked: partial });
-                }
+            if self.full_cache_matches(graph)
+                && let Some(entry) = self.full_cache.as_mut()
+            {
+                entry.cooked.nodes.extend(partial.nodes);
+            } else {
+                self.full_cache =
+                    Some(FullCache { document_id: doc_id, graph, session_revision: s_rev, headless_revision: rev, complete: false, cooked: partial });
             }
         }
         let cooked = self.full_cache.as_ref().map(|c| &c.cooked).ok_or_else(|| bad("full cook cache unavailable"))?;
@@ -389,32 +403,53 @@ impl Headless {
         maximum_side: u32,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(u32, u32, Vec<u8>), AutomationError> {
+        let doc_id = self.session.document_id;
         let graph = self.session.graph;
+        let s_rev = self.session.content_revision;
         let rev = self.revision;
-        let cached_hit = self.full_cache.as_ref().is_some_and(|c| c.graph == graph && c.revision == rev && c.complete);
+        let cached_hit = self.full_cache_matches(graph) && self.full_cache.as_ref().is_some_and(|c| c.complete);
         if !cached_hit {
             let full = self.session.cook_full_with(graph, None, cancel);
             if full.cancelled {
                 return Err(AutomationError::Other("render cancelled".into()));
             }
-            self.full_cache = Some(FullCache { graph, revision: rev, complete: true, cooked: full });
+            self.full_cache = Some(FullCache { document_id: doc_id, graph, session_revision: s_rev, headless_revision: rev, complete: true, cooked: full });
+        }
+        let sources = self.session.material_preview.sources(&self.session.pkg);
+        let mut cross_graph_nodes: std::collections::BTreeMap<usize, Vec<NodeId>> = std::collections::BTreeMap::new();
+        for source in sources.values() {
+            if source.graph != graph {
+                let nodes = cross_graph_nodes.entry(source.graph).or_default();
+                if !nodes.contains(&source.node) {
+                    nodes.push(source.node);
+                }
+            }
+        }
+        let mut extra_cooked = std::collections::BTreeMap::new();
+        for (other_graph, nodes) in cross_graph_nodes {
+            let cooked = self.session.cook_full_with(other_graph, Some(nodes), cancel);
+            if cooked.cancelled {
+                return Err(AutomationError::Other("render cancelled".into()));
+            }
+            extra_cooked.insert(other_graph, cooked);
         }
         let maps = {
             let cooked = self.full_cache.as_ref().map(|c| &c.cooked).ok_or_else(|| bad("full cook cache unavailable"))?;
-            self.session
-                .material_preview
-                .sources(&self.session.pkg)
-                .into_iter()
-                .filter_map(|(channel, source)| {
-                    let port = source.port_index(&self.session.pkg).unwrap_or(0);
-                    let img = if source.graph == graph {
-                        cooked.image(source.node, port).or_else(|| cooked.image(source.node, 0)).cloned()
-                    } else {
-                        self.session.material_image(&source).cloned()
-                    };
-                    img.map(|img| (channel.id(), img))
-                })
-                .collect::<Vec<_>>()
+            let mut out = Vec::with_capacity(sources.len());
+            for (channel, source) in sources {
+                let port = source.port_index(&self.session.pkg).unwrap_or(0);
+                let graph_cooked = if source.graph == graph { Some(cooked) } else { extra_cooked.get(&source.graph) };
+                let Some(graph_cooked) = graph_cooked else {
+                    return Err(bad(format!("channel `{}` references unavailable graph {}", channel.id(), source.graph)));
+                };
+                if let Some(err) = graph_cooked.nodes.get(&source.node).and_then(|r| r.error.as_deref()) {
+                    return Err(bad(format!("channel `{}` failed to cook: {err}", channel.id())));
+                }
+                if let Some(img) = graph_cooked.image(source.node, port).or_else(|| graph_cooked.image(source.node, 0)) {
+                    out.push((channel.id(), img.clone()));
+                }
+            }
+            out
         };
         Ok(self.render_3d_maps(options, maximum_side, maps.iter().map(|(u, img)| (*u, img)).collect()))
     }

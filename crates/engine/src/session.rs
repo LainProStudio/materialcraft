@@ -92,6 +92,9 @@ pub struct Session {
     pub cooked: Cooked,
     /// Set when the graph changed and needs cooking.
     pub dirty: bool,
+    /// Monotonic counter advanced on every content/document mutation (including undo/redo/switch),
+    /// independent of `dirty` (which preview cooks clear).
+    pub content_revision: u64,
     /// Synchronous cooks invalidate older worker results
     pub cook_epoch: u64,
     /// Cooked node outputs, shared with background cooks.
@@ -159,6 +162,7 @@ impl Session {
             explorer_clipboard: None,
             cooked: Cooked::default(),
             dirty: true,
+            content_revision: 0,
             cook_epoch: 0,
             cache: Arc::new(Mutex::new(Cache::default())),
             custom_mesh: None,
@@ -316,15 +320,21 @@ impl Session {
         self.material_preview = s.material_preview;
         self.modified = s.modified;
         self.dirty = s.dirty || self.cook_epoch != s.cook_epoch;
+        self.content_revision = self.content_revision.wrapping_add(1);
         if self.cook_epoch != s.cook_epoch {
             self.clear_preview_results();
         }
     }
 
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.content_revision = self.content_revision.wrapping_add(1);
+    }
+
     /// Mark the document modified and in need of a cook.
     pub fn changed(&mut self) {
         self.modified = true;
-        self.dirty = true;
+        self.mark_dirty();
 
         // Publish a grouped edit only after it succeeds, so rollback cannot dirty other packages
         if self.group.is_none() {
@@ -355,7 +365,7 @@ impl Session {
         let label = s.label.clone();
         self.restore(s);
         self.finish_edit();
-        self.dirty = true;
+        self.mark_dirty();
         self.refresh_links();
         Some(label)
     }
@@ -370,7 +380,7 @@ impl Session {
         let label = s.label.clone();
         self.restore(s);
         self.finish_edit();
-        self.dirty = true;
+        self.mark_dirty();
         self.refresh_links();
         Some(label)
     }
