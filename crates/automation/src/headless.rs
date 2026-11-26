@@ -17,11 +17,20 @@ pub use crate::{Filesystem, RenderOptions, Rendered};
 
 const MAX_EXPORTED_MATERIAL_BYTES: u64 = 256 << 20;
 
+struct FullCache {
+    graph: usize,
+    revision: u64,
+    complete: bool,
+    cooked: materialcraft_engine::eval::Cooked,
+}
+
 pub struct Headless {
     pub session: Session,
     fs: Filesystem,
     scene: Option<(String, Scene)>,
     light: Option<Lighting>,
+    revision: u64,
+    full_cache: Option<FullCache>,
 }
 
 /// Read a file under `fs`'s access rules
@@ -66,7 +75,12 @@ fn read_trusted(path: &str) -> Result<Vec<u8>, AutomationError> {
 
 impl Headless {
     pub fn new(session: Session, fs: Filesystem) -> Headless {
-        Headless { session, fs, scene: None, light: None }
+        Headless { session, fs, scene: None, light: None, revision: 0, full_cache: None }
+    }
+
+    fn invalidate_full_cache(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.full_cache = None;
     }
 
     /// The session a fresh server starts with: the atomic sample
@@ -118,7 +132,11 @@ impl Headless {
         if !self.trusted() {
             authorize_command(id, &params)?;
         }
-        Ok(materialcraft_engine::commands::execute_request(&mut self.session, id, &params)?)
+        let result = materialcraft_engine::commands::execute_request(&mut self.session, id, &params)?;
+        if self.session.dirty {
+            self.invalidate_full_cache();
+        }
+        Ok(result)
     }
 
     /// Run `[{id, params?}]` in order, stopping at the first error (reported with its index)
@@ -162,6 +180,7 @@ impl Headless {
         if self.session.path.is_some() {
             self.session.path = Some(path.to_string());
         }
+        self.invalidate_full_cache();
 
         Ok(())
     }
@@ -225,6 +244,7 @@ impl Headless {
         let bytes = self.read(path)?;
         let file = Path::new(path).file_name().and_then(|f| f.to_str()).unwrap_or("bitmap.png").to_string();
         let name = file_cmds::add_resource(&mut self.session, &file, bytes, name)?;
+        self.invalidate_full_cache();
         Ok(json!({"name": name}))
     }
 
@@ -272,41 +292,139 @@ impl Headless {
 
     /// Render the assigned material or a node output as PNG
     pub fn render_png(&mut self, o: &RenderOptions) -> Result<Rendered, AutomationError> {
+        self.render_png_with_cancel(o, None)
+    }
+
+    /// Render the assigned material or a node output as PNG, honouring an optional cancellation flag.
+    pub fn render_png_with_cancel(&mut self, o: &RenderOptions, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Rendered, AutomationError> {
         let max = if self.trusted() { MAX_LOCAL_RENDER_SIDE } else { MAX_PNG_SIDE };
-        let saved = self.session.preview_size;
-        if o.full {
-            self.session.preview_size = None;
-            self.session.dirty = true;
-        }
-        self.session.cook_if_dirty();
-        let out = match o.view.as_deref().unwrap_or("3d") {
-            "2d" => self.render_2d(o, max),
-            "3d" => Ok(self.render_3d(o, max)),
+        let view = o.view.as_deref().unwrap_or("3d");
+        let out = match view {
+            "2d" => {
+                if o.full {
+                    self.render_2d_full(o, max, cancel)
+                } else {
+                    self.session.cook_if_dirty();
+                    self.render_2d_from(&self.session.cooked, o, max)
+                }
+            }
+            "3d" => {
+                if o.full {
+                    self.render_3d_full(o, max, cancel)
+                } else {
+                    self.session.cook_if_dirty();
+                    Ok(self.render_3d(o, max))
+                }
+            }
             other => Err(bad(format!("unknown view `{other}` (3d or 2d)"))),
         };
-
-        if o.full {
-            self.session.preview_size = saved;
-            self.session.dirty = true;
-        }
         let (w, h, rgba) = out?;
         let png = encode_png(w, h, rgba)?;
         check_png(png.len())?;
         Ok(Rendered { width: w, height: h, png })
     }
 
-    fn render_2d(&mut self, options: &RenderOptions, maximum_side: u32) -> Result<(u32, u32, Vec<u8>), AutomationError> {
-        let image = match options.node {
-            Some(n) => self.session.cooked.image(NodeId(n), options.port.unwrap_or(0)).ok_or_else(|| bad(format!("node {n} has no cooked output")))?,
-            None => self.session.view2d_image().map(|(_, i)| i).ok_or_else(|| bad("nothing to show: the graph has no outputs; pass `node`"))?,
-        };
+    fn resolve_2d_target(&self, options: &RenderOptions) -> Result<(NodeId, usize), AutomationError> {
+        if let Some(n) = options.node {
+            return Ok((NodeId(n), options.port.unwrap_or(0)));
+        }
+        let g = self.session.graph()?;
+        let id = self
+            .session
+            .view2d
+            .node
+            .filter(|id| g.node(*id).is_ok())
+            .or_else(|| self.session.selection.last().copied())
+            .or_else(|| g.nodes.iter().find(|n| n.def == "output").map(|n| n.id))
+            .ok_or_else(|| bad("nothing to show: the graph has no outputs; pass `node`"))?;
+        let port = if Some(id) == self.session.view2d.node { self.session.view2d.port } else { 0 };
+        Ok((id, port))
+    }
 
-        let (w, h) = (options.width.unwrap_or(image.width()).clamp(16, maximum_side), options.height.unwrap_or(image.height()).clamp(16, maximum_side));
-        let image = image.resize(w, h, true);
-        Ok((w, h, image.to_rgba8_display()))
+    fn render_2d_full(
+        &mut self,
+        options: &RenderOptions,
+        maximum_side: u32,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(u32, u32, Vec<u8>), AutomationError> {
+        let (target_id, port) = self.resolve_2d_target(options)?;
+        let graph = self.session.graph;
+        let rev = self.revision;
+        let cached_hit = self.full_cache.as_ref().is_some_and(|c| c.graph == graph && c.revision == rev && c.cooked.image(target_id, port).is_some());
+        if !cached_hit {
+            let partial = self.session.cook_full_with(graph, Some(vec![target_id]), cancel);
+            if partial.cancelled {
+                return Err(AutomationError::Other("render cancelled".into()));
+            }
+            match &mut self.full_cache {
+                Some(entry) if entry.graph == graph && entry.revision == rev => {
+                    entry.cooked.nodes.extend(partial.nodes);
+                }
+                slot => {
+                    *slot = Some(FullCache { graph, revision: rev, complete: false, cooked: partial });
+                }
+            }
+        }
+        let cooked = self.full_cache.as_ref().map(|c| &c.cooked).ok_or_else(|| bad("full cook cache unavailable"))?;
+        let image =
+            cooked.image(target_id, port).or_else(|| cooked.image(target_id, 0)).ok_or_else(|| bad(format!("node {} has no cooked output", target_id.0)))?;
+        render_2d_image(image, options, maximum_side)
+    }
+
+    fn render_2d_from(
+        &self,
+        cooked: &materialcraft_engine::eval::Cooked,
+        options: &RenderOptions,
+        maximum_side: u32,
+    ) -> Result<(u32, u32, Vec<u8>), AutomationError> {
+        let (target_id, port) = self.resolve_2d_target(options)?;
+        let image =
+            cooked.image(target_id, port).or_else(|| cooked.image(target_id, 0)).ok_or_else(|| bad(format!("node {} has no cooked output", target_id.0)))?;
+        render_2d_image(image, options, maximum_side)
+    }
+
+    fn render_3d_full(
+        &mut self,
+        options: &RenderOptions,
+        maximum_side: u32,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(u32, u32, Vec<u8>), AutomationError> {
+        let graph = self.session.graph;
+        let rev = self.revision;
+        let cached_hit = self.full_cache.as_ref().is_some_and(|c| c.graph == graph && c.revision == rev && c.complete);
+        if !cached_hit {
+            let full = self.session.cook_full_with(graph, None, cancel);
+            if full.cancelled {
+                return Err(AutomationError::Other("render cancelled".into()));
+            }
+            self.full_cache = Some(FullCache { graph, revision: rev, complete: true, cooked: full });
+        }
+        let maps = {
+            let cooked = self.full_cache.as_ref().map(|c| &c.cooked).ok_or_else(|| bad("full cook cache unavailable"))?;
+            self.session
+                .material_preview
+                .sources(&self.session.pkg)
+                .into_iter()
+                .filter_map(|(channel, source)| {
+                    let port = source.port_index(&self.session.pkg).unwrap_or(0);
+                    let img = if source.graph == graph {
+                        cooked.image(source.node, port).or_else(|| cooked.image(source.node, 0)).cloned()
+                    } else {
+                        self.session.material_image(&source).cloned()
+                    };
+                    img.map(|img| (channel.id(), img))
+                })
+                .collect::<Vec<_>>()
+        };
+        Ok(self.render_3d_maps(options, maximum_side, maps.iter().map(|(u, img)| (*u, img)).collect()))
     }
 
     fn render_3d(&mut self, o: &RenderOptions, max: u32) -> (u32, u32, Vec<u8>) {
+        let maps = self.session.material_maps().into_iter().map(|(k, img)| (k, img.clone())).collect::<Vec<_>>();
+        self.render_3d_maps(o, max, maps.iter().map(|(k, img)| (*k, img)).collect())
+    }
+
+    fn render_3d_maps(&mut self, o: &RenderOptions, max: u32, raw_maps: Vec<(&str, &materialcraft_engine::image::Image)>) -> (u32, u32, Vec<u8>) {
         let v = &self.session.rendered_view3d();
         let scene_id = o.scene.clone().unwrap_or_else(|| v.scene.clone());
         let custom = self.session.custom_mesh.clone().filter(|_| scene_id == "custom");
@@ -331,7 +449,7 @@ impl Headless {
         let mut settings = Settings { supersample: view.samples.max(2), ..Settings::for_view(&view) };
 
         let (w, h) = (o.width.unwrap_or(1024).clamp(16, max), o.height.unwrap_or(768).clamp(16, max));
-        let maps = Maps::from_usages(self.session.material_maps());
+        let maps = Maps::from_usages(raw_maps);
         let (Some((_, scene)), Some(light)) = (&self.scene, &self.light) else { return (w, h, vec![0; (w * h * 4) as usize]) };
         let triangles = if o.hq { HQ_TRIANGLES } else { materialcraft_render::relief_triangles(&view) };
         let displaced = materialcraft_render::raised(scene, &maps, &view, triangles);
@@ -343,6 +461,29 @@ impl Headless {
         }
         (w, h, materialcraft_render::render(displaced.as_ref().unwrap_or(scene), &maps, light, &settings, w, h))
     }
+}
+
+fn render_2d_image(image: &materialcraft_engine::image::Image, options: &RenderOptions, maximum_side: u32) -> Result<(u32, u32, Vec<u8>), AutomationError> {
+    let tiling = options.tiling.unwrap_or(1.0).clamp(0.1, 64.0);
+    let has_tiling = (tiling - 1.0).abs() > 1e-6;
+    if let Some([cx, cy, cw, ch]) = options.crop {
+        if !cx.is_finite() || !cy.is_finite() || !cw.is_finite() || !ch.is_finite() || cw <= 0.0 || ch <= 0.0 {
+            return Err(bad("`crop` must be [x, y, width, height] with positive width and height"));
+        }
+        let default_w = (image.width() as f32 * cw).round().max(16.0) as u32;
+        let default_h = (image.height() as f32 * ch).round().max(16.0) as u32;
+        let (w, h) = (options.width.unwrap_or(default_w).clamp(16, maximum_side), options.height.unwrap_or(default_h).clamp(16, maximum_side));
+        let cropped =
+            materialcraft_engine::image::Image::generate_uv(w, h, image.kind(), |u, v| image.sample_stored(cx + u * cw * tiling, cy + v * ch * tiling, true));
+        return Ok((w, h, cropped.to_rgba8_display()));
+    }
+    let (w, h) = (options.width.unwrap_or(image.width()).clamp(16, maximum_side), options.height.unwrap_or(image.height()).clamp(16, maximum_side));
+    let out = if has_tiling {
+        materialcraft_engine::image::Image::generate_uv(w, h, image.kind(), |u, v| image.sample_stored(u * tiling, v * tiling, true))
+    } else {
+        image.resize(w, h, true)
+    };
+    Ok((w, h, out.to_rgba8_display()))
 }
 
 pub fn batch_reply(results: Vec<Value>, failed: Option<(usize, &str, String)>) -> Value {

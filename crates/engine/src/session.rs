@@ -446,9 +446,17 @@ impl Session {
 
     /// Cook graph `gi` at full size, without touching the preview results.
     pub fn cook_full(&self, gi: usize) -> Cooked {
+        self.cook_full_with(gi, None, None)
+    }
+
+    /// Cook graph `gi` (or only the target nodes and their dependencies) at full size,
+    /// honouring an optional cancellation flag, without touching preview results.
+    pub fn cook_full_with(&self, gi: usize, only: Option<Vec<NodeId>>, cancel: Option<&std::sync::atomic::AtomicBool>) -> Cooked {
         let dec = self.resource_decoder();
         let mut opts = Options::new(&dec);
         opts.environment = self.environment;
+        opts.only = only;
+        opts.cancel = cancel;
         materialcraft_eval::cook(&self.pkg, gi, &opts, &self.cache)
     }
 

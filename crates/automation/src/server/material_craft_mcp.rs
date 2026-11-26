@@ -86,11 +86,19 @@ impl MaterialCraftMcp {
 
     /// One control-channel method on the backend
     async fn call(&self, method: &str, p: Value) -> Result<Value, AutomationError> {
+        struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         match &*self.backend {
             Backend::Headless(h) => {
                 let (h, m) = (h.clone(), method.to_string());
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let _guard = CancelOnDrop(cancel.clone());
                 // Edits run on snapshots (`Session::edit`), so a panicking command leaves the session consistent: keep serving after a poisoned lock
-                tokio::task::spawn_blocking(move || h.lock().unwrap_or_else(PoisonError::into_inner).handle(&m, &p))
+                tokio::task::spawn_blocking(move || h.lock().unwrap_or_else(PoisonError::into_inner).handle_with_cancel(&m, &p, Some(&cancel)))
                     .await
                     .unwrap_or_else(|_| Err(AutomationError::Other(format!("internal error in `{method}`"))))
             }
