@@ -28,14 +28,22 @@ pub fn session(session: &Session, requested_graph: Option<usize>) -> J {
             "nodes": graph.nodes.iter().map(|node| {
                 let entry = cooked.and_then(|cooked| cooked.nodes.get(&node.id));
                 let (inputs, outputs) = materialcraft_eval::ports(&session.pkg, graph, node);
-                let node_cooked = entry.map(|entry| json!({
+                let node_cooked = entry.map(|entry| {
+                    let first_img = entry.outputs.first().and_then(materialcraft_eval::NodeOutput::as_image);
+                    let stats = (node.def == "output").then_some(first_img).flatten().and_then(image_stats);
+                    let mut obj = json!({
                         "error": entry.error, "ms": entry.ms, "cached": entry.cached,
                         "base": entry.base, "baseValues": entry.base_values, "parameters": entry.parameters,
                         "value": entry.outputs.first().and_then(materialcraft_eval::NodeOutput::as_value),
-                        "size": entry.outputs.first().and_then(materialcraft_eval::NodeOutput::as_image).map(|image| [image.width(), image.height()]),
-                        "kind": entry.outputs.first().and_then(materialcraft_eval::NodeOutput::as_image).map(|image| if image.is_gray() { "gray" } else { "color" }),
-                        "mean": entry.outputs.first().and_then(materialcraft_eval::NodeOutput::as_image).map(|image| image.mean()),
-                    }));
+                        "size": first_img.map(|image| [image.width(), image.height()]),
+                        "kind": first_img.map(|image| if image.is_gray() { "gray" } else { "color" }),
+                        "mean": first_img.map(|image| image.mean()),
+                    });
+                    if let Some(stats) = stats {
+                        obj["stats"] = stats;
+                    }
+                    obj
+                });
                 json!({
                     "id": node.id.0,
                     "def": node.def,
@@ -96,4 +104,96 @@ pub fn session(session: &Session, requested_graph: Option<usize>) -> J {
         "canRedo": session.can_redo(),
         "log": session.log.iter().rev().take(20).collect::<Vec<_>>(),
     })
+}
+
+/// Fast PBR range, contrast, and tile-seam diagnostics for output nodes (runs on preview images).
+fn image_stats(image: &craft_texture::Image) -> Option<J> {
+    let w = image.width() as usize;
+    let h = image.height() as usize;
+    let n = w.checked_mul(h)?;
+    if n == 0 {
+        return None;
+    }
+    let ch = if image.is_gray() { 1 } else { 4 };
+    let data = image.data();
+    let mut vals = Vec::with_capacity(n);
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    for px in data.chunks_exact(ch) {
+        let v = if ch == 1 { px[0] } else { 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2] };
+        if !v.is_finite() {
+            continue;
+        }
+        vals.push(v);
+        let d = f64::from(v);
+        sum += d;
+        sum_sq += d * d;
+        if v < min_v {
+            min_v = v;
+        }
+        if v > max_v {
+            max_v = v;
+        }
+    }
+    if vals.is_empty() {
+        return None;
+    }
+    let count = vals.len() as f64;
+    let mean = sum / count;
+    let var = (sum_sq / count - mean * mean).max(0.0);
+    let std = var.sqrt();
+    let len = vals.len();
+    let p5_idx = (len * 5) / 100;
+    let p95_idx = ((len * 95) / 100).min(len - 1);
+    let (_, p5_ref, _) = vals.select_nth_unstable_by(p5_idx, f32::total_cmp);
+    let p5 = *p5_ref;
+    let (_, p95_ref, _) = vals.select_nth_unstable_by(p95_idx, f32::total_cmp);
+    let p95 = *p95_ref;
+
+    // Tile-wrap seam ratio: mean abs diff across border wrap divided by interior neighbor diff.
+    let (seam_x, seam_y) = if w >= 4 && h >= 4 && data.len() == n * ch {
+        let px_diff = |a: usize, b: usize| -> f64 {
+            let ia = a * ch;
+            let ib = b * ch;
+            if ch == 1 {
+                f64::from((data[ia] - data[ib]).abs())
+            } else {
+                (f64::from((data[ia] - data[ib]).abs()) + f64::from((data[ia + 1] - data[ib + 1]).abs()) + f64::from((data[ia + 2] - data[ib + 2]).abs())) / 3.0
+            }
+        };
+        let mut bx = 0.0;
+        let mut ix = 0.0;
+        for y in 0..h {
+            let row = y * w;
+            bx += px_diff(row, row + w - 1);
+            ix += px_diff(row + w / 2 - 1, row + w / 2);
+        }
+        let mut by = 0.0;
+        let mut iy = 0.0;
+        let last_row = (h - 1) * w;
+        let mid_a = (h / 2 - 1) * w;
+        let mid_b = (h / 2) * w;
+        for x in 0..w {
+            by += px_diff(x, last_row + x);
+            iy += px_diff(mid_a + x, mid_b + x);
+        }
+        let rx = if ix > 1e-6 { bx / ix } else { 1.0 };
+        let ry = if iy > 1e-6 { by / iy } else { 1.0 };
+        (Some(rx), Some(ry))
+    } else {
+        (None, None)
+    };
+
+    Some(json!({
+        "min": min_v,
+        "p5": p5,
+        "mean": mean,
+        "p95": p95,
+        "max": max_v,
+        "std": std,
+        "seamX": seam_x,
+        "seamY": seam_y,
+    }))
 }

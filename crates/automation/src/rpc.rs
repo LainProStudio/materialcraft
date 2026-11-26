@@ -429,4 +429,26 @@ mod tests {
         assert_eq!(ok[1]["result"], "pong");
         assert_eq!(ok[1]["id"], 2);
     }
+    #[test]
+    fn export_supports_per_output_depths_details_cache_and_inspect_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = crate::AuthorizedWorkspace::new(None, Some(dir.path())).unwrap();
+        let h = Mutex::new(Headless::new(Headless::default_session(), crate::Filesystem::Workspace(ws)));
+
+        // Inspect should include numeric stats on output nodes.
+        let inspected = call(&h, "session.inspect", json!({})).unwrap();
+        let output_node = inspected["graph"]["nodes"].as_array().unwrap().iter().find(|n| n["def"] == "output").unwrap();
+        let stats = &output_node["cooked"]["stats"];
+        assert!(stats["min"].is_number() && stats["p5"].is_number() && stats["p95"].is_number() && stats["seamX"].is_number());
+        let id_name = output_node["params"]["identifier"].as_str().or_else(|| output_node["params"]["identifier"]["v"].as_str()).unwrap().to_string();
+
+        // Single export call with default depth 8 and per-output override 16.
+        let res = call(&h, "outputs.export", json!({"dir": ".", "depth": 8, "depths": {&id_name: 16}})).unwrap();
+        let details = res["details"].as_array().unwrap();
+        assert!(!details.is_empty());
+        let matched = details.iter().find(|d| d["identifier"] == id_name).unwrap();
+        assert_eq!(matched["depth"], 16);
+        assert!(matched["size"].is_array() && matched["bytes"].as_u64().unwrap() > 0);
+        assert!(h.lock().unwrap().full_cache_present(), "export must populate full_cache");
+    }
 }

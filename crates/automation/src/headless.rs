@@ -94,6 +94,11 @@ impl Headless {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn full_cache_present(&self) -> bool {
+        self.full_cache.is_some()
+    }
+
     /// The session a fresh server starts with: the atomic sample
     pub fn default_session() -> Session {
         materialcraft_engine::sample_session()
@@ -263,9 +268,24 @@ impl Headless {
     /// Export every output of a graph into folder `dir`
     pub fn export(&mut self, p: &Value) -> Result<Value, AutomationError> {
         let dir = p.get("dir").and_then(Value::as_str).ok_or_else(|| bad("`dir` is required"))?;
-        let (files, mut report) = materialcraft_engine::material_bake::export(&self.session, p, |path| {
+        let req = materialcraft_engine::ExportRequest::from_params(&self.session, p)?;
+        let doc_id = self.session.document_id;
+        let s_rev = self.session.content_revision;
+        let rev = self.revision;
+        let cached = self.full_cache_matches(req.graph).then(|| self.full_cache.as_ref().map(|c| &c.cooked)).flatten();
+        let (files, mut report, fresh_cooked) = materialcraft_engine::material_bake::export_with_cooked(&self.session, p, cached, |path| {
             self.read(path).map_err(|e| materialcraft_engine::EngineError::Other(e.to_string()))
         })?;
+        if let Some(cooked) = fresh_cooked {
+            if self.full_cache_matches(req.graph)
+                && let Some(entry) = self.full_cache.as_mut()
+            {
+                entry.cooked.nodes.extend(cooked.nodes);
+            } else {
+                self.full_cache =
+                    Some(FullCache { document_id: doc_id, graph: req.graph, session_revision: s_rev, headless_revision: rev, complete: false, cooked });
+            }
+        }
         self.create_dir_all(dir)?;
 
         let mut written = Vec::new();
@@ -273,6 +293,11 @@ impl Headless {
             let path = if dir == "." { exported.file.clone() } else { format!("{}/{}", dir.trim_end_matches('/'), exported.file) };
             self.write(&path, &exported.bytes)?;
             written.push(path);
+        }
+        if let Some(details) = report.get_mut("details").and_then(Value::as_array_mut) {
+            for (detail, path) in details.iter_mut().zip(&written) {
+                detail["path"] = json!(path);
+            }
         }
         report["files"] = json!(written);
         Ok(report)
