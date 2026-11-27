@@ -27,12 +27,14 @@ pub fn cook(package: &Package, graph_index: usize, options: &Options, cache: &Mu
     variables.insert("$normalformat".into(), Value::Int(options.environment.normal_format));
     variables.insert("$physicalsize".into(), Value::Float3(graph.physical_size));
 
+    let is_cancelled = || options.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed));
+
     // Group the topological order into dependency-free wavefronts so independent branches
     // (multiple generators or output chains) cook concurrently across rayon workers.
     let waves = topological_waves(&prepared);
 
     for wave in waves {
-        if options.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        if is_cancelled() {
             cooked.cancelled = true;
             break;
         }
@@ -42,30 +44,55 @@ pub fn cook(package: &Package, graph_index: usize, options: &Options, cache: &Mu
                 && let Some(node) = prepared.index.node(id)
             {
                 let input = input_image(graph, node, options, &mut previews);
+                if is_cancelled() {
+                    cooked.cancelled = true;
+                    break;
+                }
                 let result = cook_node(package, graph_index, &prepared, node, &cooked, &variables, options, input, cache);
                 cooked.nodes.insert(id, result);
+                if is_cancelled() {
+                    cooked.cancelled = true;
+                    break;
+                }
             }
             continue;
         }
 
         // Pre-resolve any `input_*` preview images on the main thread before parallel dispatch.
         let mut wave_inputs: Vec<(NodeId, &Node, Option<Image>)> = Vec::with_capacity(wave.len());
+        let mut cancelled_in_prep = false;
         for id in wave {
+            if is_cancelled() {
+                cancelled_in_prep = true;
+                break;
+            }
             if let Some(node) = prepared.index.node(id) {
                 let img = input_image(graph, node, options, &mut previews).cloned();
                 wave_inputs.push((id, node, img));
             }
         }
+        if cancelled_in_prep {
+            cooked.cancelled = true;
+            break;
+        }
 
         let results: Vec<(NodeId, crate::NodeResult)> = wave_inputs
             .par_iter()
-            .map(|(id, node, img)| {
+            .filter_map(|(id, node, img)| {
+                if is_cancelled() {
+                    return None;
+                }
                 let result = cook_node(package, graph_index, &prepared, node, &cooked, &variables, options, img.as_ref(), cache);
-                (*id, result)
+                Some((*id, result))
             })
             .collect();
+        let skipped = results.len() < wave_inputs.len();
         for (id, result) in results {
             cooked.nodes.insert(id, result);
+        }
+        if skipped || is_cancelled() {
+            cooked.cancelled = true;
+            break;
         }
     }
 
