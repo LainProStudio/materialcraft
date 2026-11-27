@@ -4,8 +4,8 @@
 //! exposure and ACES tone mapping. The height output displaces real geometry ([`Scene::with_relief`]).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::{Displacement, Light, Look, Relief};
 use craft_texture::{Image, linear_to_srgb};
@@ -108,17 +108,29 @@ impl Scene {
         let repeats = displacement.repeats.map(|repeats| if repeats.is_finite() { repeats.max(0.01) } else { 1.0 });
 
         // Vertices at the same spot (to 0.1 mm) are one point of the surface
-        let spots: Vec<[i32; 3]> = mesh.positions.iter().map(|p| (*p * 1e4).round().as_ivec3().to_array()).collect();
-        let mut spot_sums: HashMap<[i32; 3], (Vec3, f32, f32)> = HashMap::new();
-        for ((spot, n), uv) in spots.iter().zip(&mesh.normals).zip(&mesh.uvs) {
+        const PARALLEL_VERTICES_MIN: usize = 4096;
+        let (spots, sampled_heights): (Vec<[i32; 3]>, Vec<f32>) = if mesh.positions.len() >= PARALLEL_VERTICES_MIN {
+            let spots = mesh.positions.par_iter().map(|p| (*p * 1e4).round().as_ivec3().to_array()).collect();
+            let heights = mesh.uvs.par_iter().map(|uv| height.sample_gray(uv.x * repeats[0], uv.y * repeats[1], true)).collect();
+            (spots, heights)
+        } else {
+            let spots = mesh.positions.iter().map(|p| (*p * 1e4).round().as_ivec3().to_array()).collect();
+            let heights = mesh.uvs.iter().map(|uv| height.sample_gray(uv.x * repeats[0], uv.y * repeats[1], true)).collect();
+            (spots, heights)
+        };
+        let mut spot_sums: HashMap<[i32; 3], (Vec3, f32, f32)> = HashMap::with_capacity(spots.len());
+        for ((spot, n), h) in spots.iter().zip(&mesh.normals).zip(sampled_heights) {
             let (normal_sum, height_sum, count) = spot_sums.entry(*spot).or_default();
             *normal_sum += *n;
-            *height_sum += height.sample_gray(uv.x * repeats[0], uv.y * repeats[1], true);
+            *height_sum += h;
             *count += 1.0;
         }
 
-        let offsets: Vec<Vec3> =
-            spots.iter().map(|spot| spot_sums.get(spot).map_or(Vec3::ZERO, |(n, h, count)| n.normalize_or_zero() * depth * (h / count - level))).collect();
+        let offsets: Vec<Vec3> = if spots.len() >= PARALLEL_VERTICES_MIN {
+            spots.par_iter().map(|spot| spot_sums.get(spot).map_or(Vec3::ZERO, |(n, h, count)| n.normalize_or_zero() * depth * (h / count - level))).collect()
+        } else {
+            spots.iter().map(|spot| spot_sums.get(spot).map_or(Vec3::ZERO, |(n, h, count)| n.normalize_or_zero() * depth * (h / count - level))).collect()
+        };
 
         // The normal accumulation needs a separate map, so release the height sums first
         drop(spot_sums);
@@ -126,7 +138,7 @@ impl Scene {
         if displacement.shade_relief {
             // Normals of the displaced surface, shared per spot so seams don't show
             let moved = |i: u32| mesh.positions.get(i as usize).zip(offsets.get(i as usize)).map(|(p, o)| *p + *o);
-            let mut face_sums: HashMap<[i32; 3], Vec3> = HashMap::new();
+            let mut face_sums: HashMap<[i32; 3], Vec3> = HashMap::with_capacity(spots.len());
             for triangle in mesh.indices.as_chunks::<3>().0 {
                 let (Some(a), Some(b), Some(c)) = (moved(triangle[0]), moved(triangle[1]), moved(triangle[2])) else { continue };
                 let face = (b - a).cross(c - a);
@@ -144,8 +156,12 @@ impl Scene {
             mesh.tangents.clear();
         }
 
-        for (p, offset) in mesh.positions.iter_mut().zip(&offsets) {
-            *p += *offset;
+        if mesh.positions.len() >= PARALLEL_VERTICES_MIN {
+            mesh.positions.par_iter_mut().zip(&offsets).for_each(|(p, offset)| *p += *offset);
+        } else {
+            for (p, offset) in mesh.positions.iter_mut().zip(&offsets) {
+                *p += *offset;
+            }
         }
 
         // Subdivision scratch must not overlap tangent and BVH construction
@@ -182,16 +198,34 @@ pub fn builtin_mesh(id: &str) -> Mesh {
 }
 
 /// Prefiltered environment lighting.
+#[derive(Clone)]
 pub struct Lighting {
     pub name: String,
     pub specular: Vec<EnvImage>,
     pub sh: [[f32; 3]; 9],
 }
 
+type CachedLighting = (&'static str, Vec<EnvImage>, [[f32; 3]; 9]);
+
+static LIGHTING_CACHE: Mutex<Vec<CachedLighting>> = Mutex::new(Vec::new());
+
 impl Lighting {
     pub fn new(id: &str) -> Lighting {
-        let env = ibl::environment(ibl::by_id(id), 256);
-        Lighting { name: id.into(), specular: ibl::prefilter(&env, 6), sh: ibl::sh9(&env) }
+        let canonical = ibl::by_id(id);
+        {
+            let cache = LIGHTING_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((_, specular, sh)) = cache.iter().find(|(name, _, _)| *name == canonical) {
+                return Lighting { name: id.into(), specular: specular.clone(), sh: *sh };
+            }
+        }
+        let env = ibl::environment(canonical, 256);
+        let specular = ibl::prefilter(&env, 6);
+        let sh = ibl::sh9(&env);
+        let mut cache = LIGHTING_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+        if !cache.iter().any(|(name, _, _)| *name == canonical) {
+            cache.push((canonical, specular.clone(), sh));
+        }
+        Lighting { name: id.into(), specular, sh }
     }
 
     fn diffuse(&self, n: Vec3) -> Vec3 {
@@ -363,9 +397,9 @@ fn env_brdf(roughness: f32, ndv: f32) -> (f32, f32) {
     (a004 * -1.04 + r[2], a004 * 1.04 + r[3])
 }
 
-fn rotate_y(v: Vec3, deg: f32) -> Vec3 {
-    let (s, c) = deg.to_radians().sin_cos();
-    Vec3::new(v.x * c + v.z * s, v.y, -v.x * s + v.z * c)
+#[inline]
+fn rotate_y_sc(v: Vec3, sin: f32, cos: f32) -> Vec3 {
+    Vec3::new(v.x * cos + v.z * sin, v.y, -v.x * sin + v.z * cos)
 }
 
 /// The material's alpha at `uv`: the opacity output, else the base color's alpha channel, else
@@ -406,6 +440,9 @@ struct Px {
     footprint: [f32; 2],
     /// Original camera-ray origin before clipping or transparency passes
     ray_start: Vec3,
+    /// Precomputed `(sin, cos)` of `-env_rotation`
+    env_rot_sin: f32,
+    env_rot_cos: f32,
 }
 
 /// The fraction of `n`'s hemisphere at `p` that is open within `reach` (cosine-weighted).
@@ -480,21 +517,39 @@ impl Shaded {
     }
 }
 
+/// Stack-allocated arriving lights (up to 2 point lights + 1 key light), avoiding per-sample heap allocations
+struct Arriving {
+    items: [(Vec3, Vec3); 3],
+    len: usize,
+}
+
+impl Arriving {
+    #[inline]
+    fn as_slice(&self) -> &[(Vec3, Vec3)] {
+        &self.items[..self.len]
+    }
+}
+
 /// Light arriving at a surface from the point lights and the key light, as (direction, color) pairs
-fn arriving(scene: &Scene, s: &Settings, px: &Px, surface: &Surface) -> impl Iterator<Item = (Vec3, Vec3)> {
-    let point_lights = s.lights.into_iter().flatten().filter_map(move |light| {
+fn arriving(scene: &Scene, s: &Settings, px: &Px, surface: &Surface) -> Arriving {
+    let mut out = Arriving { items: [(Vec3::ZERO, Vec3::ZERO); 3], len: 0 };
+    for light in s.lights.into_iter().flatten() {
         let position = scene.center + Vec3::from(light.position) * scene.radius;
         let to_light = position - surface.p;
         let distance = to_light.length();
-        let direction = to_light.try_normalize()?;
+        let Some(direction) = to_light.try_normalize() else { continue };
 
-        let lit = surface.face.dot(direction) > 0.0 && !(s.shadows && scene.bvh.occluded(surface.p, direction, distance));
-        lit.then_some((direction, Vec3::from(light.color)))
-    });
-    let key_light =
-        (s.key_light > 0.0 && surface.face.dot(px.key) > 0.0 && !scene.bvh.occluded(surface.p, px.key, f32::MAX)).then_some((px.key, Vec3::splat(s.key_light)));
+        if surface.face.dot(direction) > 0.0 && !(s.shadows && scene.bvh.occluded(surface.p, direction, distance)) {
+            out.items[out.len] = (direction, Vec3::from(light.color));
+            out.len += 1;
+        }
+    }
+    if s.key_light > 0.0 && surface.face.dot(px.key) > 0.0 && !scene.bvh.occluded(surface.p, px.key, f32::MAX) {
+        out.items[out.len] = (px.key, Vec3::splat(s.key_light));
+        out.len += 1;
+    }
 
-    point_lights.chain(key_light).collect::<Vec<_>>().into_iter()
+    out
 }
 
 /// The physically based models: metal and dielectric base, with the coat, fuzz, subsurface,
@@ -504,7 +559,7 @@ fn physical(scene: &Scene, light: &Lighting, s: &Settings, px: &Px, surface: &Su
     let look = &s.look;
     let Surface { n, v, base, rough, metal, ao, .. } = *surface;
     let ndv = n.dot(v).clamp(1e-4, 1.0);
-    let rotated = |direction: Vec3| rotate_y(direction, -s.env_rotation);
+    let rotated = |direction: Vec3| rotate_y_sc(direction, px.env_rot_sin, px.env_rot_cos);
     let environment = if s.env_light { 1.0 } else { 0.0 };
 
     // The glossy models carry their own specular color; the others derive it from the metalness
@@ -546,7 +601,8 @@ fn physical(scene: &Scene, light: &Lighting, s: &Settings, px: &Px, surface: &Su
         let edge = (1.0 - ndv).powf(1.0 + 4.0 * (1.0 - look.fuzz_roughness));
         color += irradiance * look.fuzz_color * (look.fuzz_weight * edge * environment * ao);
     }
-    for (direction, arriving) in arriving(scene, s, px, surface) {
+    let arriving_lights = arriving(scene, s, px, surface);
+    for &(direction, arriving) in arriving_lights.as_slice() {
         color += direct(n, v, direction, diffuse, f0, rough) * arriving;
     }
 
@@ -559,7 +615,7 @@ fn physical(scene: &Scene, light: &Lighting, s: &Settings, px: &Px, surface: &Su
         // Under the coat: tinted by it, darkened by light caught inside it and dimmed by what it reflects
         color *= Vec3::ONE.lerp(look.coat_color, look.coat_weight) * (1.0 - fresnel) * (1.0 - (1.0 - DARKEST_COAT) * look.coat_weight * look.coat_darkening);
         color += light.specular(rotated(mirror), coat_rough) * (fresnel * environment * ao);
-        for (direction, arriving) in arriving(scene, s, px, surface) {
+        for &(direction, arriving) in arriving_lights.as_slice() {
             color += direct(surface.face, v, direction, Vec3::ZERO, Vec3::splat(coat_f0), coat_rough) * arriving * look.coat_weight;
         }
     }
@@ -575,12 +631,12 @@ fn classic(scene: &Scene, light: &Lighting, s: &Settings, px: &Px, surface: &Sur
     let environment = if s.env_light { 1.0 } else { 0.0 };
     let shininess = 2.0 + look.glossiness.powi(2) * MAX_SHININESS;
 
-    let mut color = (light.diffuse(rotate_y(n, -s.env_rotation)) * environment + Vec3::from(s.ambient)) * base * ao;
+    let mut color = (light.diffuse(rotate_y_sc(n, px.env_rot_sin, px.env_rot_cos)) * environment + Vec3::from(s.ambient)) * base * ao;
     if highlights {
         let reflected = (n * (2.0 * n.dot(v)) - v).normalize_or_zero();
-        color += light.specular(rotate_y(reflected, -s.env_rotation), 1.0 - look.glossiness) * look.glossy_specular * (environment * ao);
+        color += light.specular(rotate_y_sc(reflected, px.env_rot_sin, px.env_rot_cos), 1.0 - look.glossiness) * look.glossy_specular * (environment * ao);
     }
-    for (direction, arriving) in arriving(scene, s, px, surface) {
+    for &(direction, arriving) in arriving(scene, s, px, surface).as_slice() {
         let facing = n.dot(direction).max(0.0);
         color += base * arriving * (facing / std::f32::consts::PI);
         if highlights {
@@ -848,6 +904,7 @@ pub fn render_cancellable(scene: &Scene, maps: &Maps, light: &Lighting, s: &Sett
         Output::Data => light.map(|v| linear_to_srgb(tone_map(s.color_space, v))),
     };
     let exposure = 2f32.powf(s.exposure);
+    let (env_rot_sin, env_rot_cos) = (-s.env_rotation).to_radians().sin_cos();
 
     let mut out = vec![0u8; (w * h * 4) as usize];
     out.par_chunks_mut(w as usize * 4).enumerate().for_each(|(y, row)| {
@@ -863,11 +920,11 @@ pub fn render_cancellable(scene: &Scene, maps: &Maps, light: &Lighting, s: &Sett
                     let py = 1.0 - (y as f32 + (sy as f32 + 0.5) / ss as f32) / h as f32 * 2.0;
                     let ray = cam.ray(Vec2::new(px, py), aspect);
                     let (origin, reach) = clipped(&cam, &ray, s.clip);
-                    let p = Px { key, jitter: jitter(x as u32 * ss + sx, y as u32 * ss + sy), footprint, ray_start: ray.origin };
+                    let p = Px { key, jitter: jitter(x as u32 * ss + sx, y as u32 * ss + sy), footprint, ray_start: ray.origin, env_rot_sin, env_rot_cos };
                     let miss = match (s.background, environment) {
                         (Background::Studio, _) => behind(backdrop(Vec2::new(px, py))),
                         (Background::Color, _) => uniform,
-                        (Background::Environment, Some(e)) if s.env_light => behind(e.sample(rotate_y(ray.dir, -s.env_rotation)) * exposure),
+                        (Background::Environment, Some(e)) if s.env_light => behind(e.sample(rotate_y_sc(ray.dir, env_rot_sin, env_rot_cos)) * exposure),
                         (Background::Environment, _) => Vec3::ZERO,
                     };
                     acc += trace(scene, maps, light, s, origin, ray.dir, reach, &p, k, miss);

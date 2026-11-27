@@ -34,9 +34,16 @@ pub fn check_png(bytes: usize) -> Result<(), AutomationError> {
 }
 
 pub fn encode_png(w: u32, h: u32, rgba: Vec<u8>) -> Result<Vec<u8>, AutomationError> {
-    let img = image::RgbaImage::from_raw(w, h, rgba).ok_or_else(|| AutomationError::Other("render buffer has the wrong size".into()))?;
+    use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+
+    let expected = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4));
+    if expected != Some(rgba.len()) {
+        return Err(AutomationError::Other("render buffer has the wrong size".into()));
+    }
     let mut png = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| AutomationError::Other(format!("PNG encoding failed: {e}")))?;
+    let encoder = PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Sub);
+    encoder.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8).map_err(|e| AutomationError::Other(format!("PNG encoding failed: {e}")))?;
     Ok(png)
 }
 

@@ -2,6 +2,7 @@
 //! box queries (used by picking, baking and brush stamps).
 
 use glam::{Vec3, Vec3A};
+use rayon::prelude::*;
 
 use crate::Mesh;
 
@@ -29,11 +30,14 @@ pub struct Bvh {
     nodes: Vec<Node>,
     /// Triangle vertices in BVH order.
     tris: Vec<[Vec3; 3]>,
+    /// Precomputed `[v0, v1 - v0, v2 - v0]` in BVH order for Möller–Trumbore ray tests.
+    tri_edges: Vec<[Vec3; 3]>,
     /// Original triangle index of each entry in `tris`.
     order: Vec<u32>,
 }
 
 const LEAF: usize = 4;
+const PARALLEL_BUILD_MIN: usize = 4096;
 
 /// Traversal stack of (node, entry distance): inline for typical depths (no allocation per
 /// ray), spilling to the heap for degenerate trees.
@@ -79,6 +83,160 @@ fn area(lo: Vec3, hi: Vec3) -> f32 {
     d.x * d.y + d.y * d.z + d.z * d.x
 }
 
+struct TriBounds {
+    lo: Vec3,
+    hi: Vec3,
+    cent: Vec3,
+}
+
+fn find_sah_split(order: &mut [u32], bounds: &[TriBounds]) -> (Vec3, Vec3, Option<usize>) {
+    let c = order.len();
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    let (mut clo, mut chi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for &t in order.iter() {
+        let tb = &bounds[t as usize];
+        lo = lo.min(tb.lo);
+        hi = hi.max(tb.hi);
+        grow(&mut clo, &mut chi, tb.cent);
+    }
+
+    if c <= LEAF {
+        return (lo, hi, None);
+    }
+
+    // Binned SAH along the widest centroid axis
+    let ext = chi - clo;
+    let axis = if ext.x >= ext.y && ext.x >= ext.z {
+        0
+    } else if ext.y >= ext.z {
+        1
+    } else {
+        2
+    };
+    if ext[axis] <= 1e-12 {
+        return (lo, hi, None);
+    }
+
+    let inv_ext = BINS as f32 / ext[axis];
+    let origin = clo[axis];
+    let bin_of = |p: Vec3| (((p[axis] - origin) * inv_ext) as usize).min(BINS - 1);
+    let mut bins = [(0u32, Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)); BINS];
+    for &t in order.iter() {
+        let tb = &bounds[t as usize];
+        let b = &mut bins[bin_of(tb.cent)];
+        b.0 += 1;
+        b.1 = b.1.min(tb.lo);
+        b.2 = b.2.max(tb.hi);
+    }
+
+    // Prefix and suffix sweeps compute all split costs in O(BINS)
+    let mut left_n = [0u32; BINS];
+    let mut left_area = [0.0f32; BINS];
+    let (mut acc_n, mut acc_lo, mut acc_hi) = (0u32, Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for i in 0..BINS - 1 {
+        acc_n += bins[i].0;
+        acc_lo = acc_lo.min(bins[i].1);
+        acc_hi = acc_hi.max(bins[i].2);
+        left_n[i] = acc_n;
+        left_area[i] = area(acc_lo, acc_hi);
+    }
+
+    let (mut best, mut best_cost) = (0usize, f32::MAX);
+    let (mut r_n, mut r_lo, mut r_hi) = (0u32, Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for split in (1..BINS).rev() {
+        r_n += bins[split].0;
+        r_lo = r_lo.min(bins[split].1);
+        r_hi = r_hi.max(bins[split].2);
+        let l_n = left_n[split - 1];
+        if l_n == 0 || r_n == 0 {
+            continue;
+        }
+        let cost = l_n as f32 * left_area[split - 1] + r_n as f32 * area(r_lo, r_hi);
+        if cost < best_cost {
+            best_cost = cost;
+            best = split;
+        }
+    }
+
+    if best == 0 || best_cost >= c as f32 * area(lo, hi) {
+        return (lo, hi, None);
+    }
+
+    let mut i = 0;
+    for j in 0..order.len() {
+        if bin_of(bounds[order[j] as usize].cent) < best {
+            order.swap(i, j);
+            i += 1;
+        }
+    }
+    if i == 0 || i == c {
+        return (lo, hi, None);
+    }
+
+    (lo, hi, Some(i))
+}
+
+fn build_serial(order: &mut [u32], base_first: u32, bounds: &[TriBounds]) -> Vec<Node> {
+    let mut nodes = Vec::with_capacity((order.len() / 2).max(1));
+    nodes.push(Node { lo: Vec3A::ZERO, hi: Vec3A::ZERO, first: base_first, count: order.len() as u32 });
+    let mut stack = vec![(0usize, 0usize, order.len())];
+    while let Some((ni, rel_f, c)) = stack.pop() {
+        let (lo, hi, split) = find_sah_split(&mut order[rel_f..rel_f + c], bounds);
+        nodes[ni].lo = lo.into();
+        nodes[ni].hi = hi.into();
+        let Some(mid) = split else { continue };
+        let left = nodes.len();
+        nodes.push(Node { lo: Vec3A::ZERO, hi: Vec3A::ZERO, first: base_first + rel_f as u32, count: mid as u32 });
+        nodes.push(Node { lo: Vec3A::ZERO, hi: Vec3A::ZERO, first: base_first + (rel_f + mid) as u32, count: (c - mid) as u32 });
+        nodes[ni].first = left as u32;
+        nodes[ni].count = 0;
+        stack.push((left, rel_f, mid));
+        stack.push((left + 1, rel_f + mid, c - mid));
+    }
+    nodes
+}
+
+fn build_subtree(order: &mut [u32], base_first: u32, bounds: &[TriBounds]) -> Vec<Node> {
+    if order.len() < PARALLEL_BUILD_MIN {
+        return build_serial(order, base_first, bounds);
+    }
+
+    let (lo, hi, split) = find_sah_split(order, bounds);
+    let Some(mid) = split else {
+        return vec![Node { lo: lo.into(), hi: hi.into(), first: base_first, count: order.len() as u32 }];
+    };
+
+    let (left_order, right_order) = order.split_at_mut(mid);
+    let (mut left_nodes, mut right_nodes) =
+        rayon::join(|| build_subtree(left_order, base_first, bounds), || build_subtree(right_order, base_first + mid as u32, bounds));
+
+    // Stitch subtrees while keeping left/right roots adjacent at indices 1 and 2
+    let left_len = left_nodes.len() as u32;
+    for node in &mut left_nodes {
+        if node.count == 0 {
+            node.first += 2;
+        }
+    }
+    let right_shift = left_len + 1;
+    for node in &mut right_nodes {
+        if node.count == 0 {
+            node.first += right_shift;
+        }
+    }
+
+    let mut out = Vec::with_capacity(1 + left_nodes.len() + right_nodes.len());
+    out.push(Node { lo: lo.into(), hi: hi.into(), first: 1, count: 0 });
+    out.push(left_nodes[0]);
+    out.push(right_nodes[0]);
+    if left_nodes.len() > 1 {
+        out.extend_from_slice(&left_nodes[1..]);
+    }
+    if right_nodes.len() > 1 {
+        out.extend_from_slice(&right_nodes[1..]);
+    }
+    out
+}
+
 impl Bvh {
     pub fn new(mesh: &Mesh) -> Bvh {
         let n = mesh.triangle_count();
@@ -88,87 +246,31 @@ impl Bvh {
             let p = |i: usize| mesh.positions.get(i).copied().unwrap_or(Vec3::ZERO);
             tris.push([p(a), p(b), p(c)]);
         }
-        let mut order: Vec<u32> = (0..tris.len() as u32).collect();
-        let cent: Vec<Vec3> = tris.iter().map(|t| (t[0] + t[1] + t[2]) / 3.0).collect();
-        let mut nodes = vec![Node { lo: Vec3A::ZERO, hi: Vec3A::ZERO, first: 0, count: tris.len() as u32 }];
-        let mut stack = vec![0usize];
-        while let Some(ni) = stack.pop() {
-            let Node { first, count, .. } = nodes[ni];
-            let (f, c) = (first as usize, count as usize);
-            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-            let (mut clo, mut chi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-            for &t in &order[f..f + c] {
-                for p in tris[t as usize] {
-                    grow(&mut lo, &mut hi, p);
-                }
-                grow(&mut clo, &mut chi, cent[t as usize]);
-            }
-            nodes[ni].lo = lo.into();
-            nodes[ni].hi = hi.into();
-            if c <= LEAF {
-                continue;
-            }
-            // Binned SAH along the widest centroid axis.
-            let ext = chi - clo;
-            let axis = if ext.x >= ext.y && ext.x >= ext.z {
-                0
-            } else if ext.y >= ext.z {
-                1
-            } else {
-                2
-            };
-            if ext[axis] <= 1e-12 {
-                continue;
-            }
-            let mut bins = [(0u32, Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)); BINS];
-            let bin_of = |p: Vec3| (((p[axis] - clo[axis]) / ext[axis] * BINS as f32) as usize).min(BINS - 1);
-            for &t in &order[f..f + c] {
-                let b = &mut bins[bin_of(cent[t as usize])];
-                b.0 += 1;
-                for p in tris[t as usize] {
-                    grow(&mut b.1, &mut b.2, p);
-                }
-            }
-            let (mut best, mut best_cost) = (0usize, f32::MAX);
-            for split in 1..BINS {
-                let side = |r: std::ops::Range<usize>| {
-                    r.fold((0u32, Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(n, l, h), i| (n + bins[i].0, l.min(bins[i].1), h.max(bins[i].2)))
-                };
-                let (nl, ll, lh) = side(0..split);
-                let (nr, rl, rh) = side(split..BINS);
-                if nl == 0 || nr == 0 {
-                    continue;
-                }
-                let cost = nl as f32 * area(ll, lh) + nr as f32 * area(rl, rh);
-                if cost < best_cost {
-                    best_cost = cost;
-                    best = split;
-                }
-            }
-            if best == 0 || best_cost >= c as f32 * area(lo, hi) {
-                continue;
-            }
-            let slice = &mut order[f..f + c];
-            let mut i = 0;
-            for j in 0..slice.len() {
-                if bin_of(cent[slice[j] as usize]) < best {
-                    slice.swap(i, j);
-                    i += 1;
-                }
-            }
-            if i == 0 || i == c {
-                continue;
-            }
-            let left = nodes.len();
-            nodes.push(Node { lo: Vec3A::ZERO, hi: Vec3A::ZERO, first, count: i as u32 });
-            nodes.push(Node { lo: Vec3A::ZERO, hi: Vec3A::ZERO, first: first + i as u32, count: (c - i) as u32 });
-            nodes[ni].first = left as u32;
-            nodes[ni].count = 0;
-            stack.push(left);
-            stack.push(left + 1);
+        if tris.is_empty() {
+            return Bvh { nodes: vec![Node { lo: Vec3A::ZERO, hi: Vec3A::ZERO, first: 0, count: 0 }], tris, tri_edges: Vec::new(), order: Vec::new() };
         }
-        let tris = order.iter().map(|t| tris[*t as usize]).collect();
-        Bvh { nodes, tris, order }
+
+        let bounds: Vec<TriBounds> = if tris.len() >= PARALLEL_BUILD_MIN {
+            tris.par_iter()
+                .map(|t| TriBounds { lo: t[0].min(t[1]).min(t[2]), hi: t[0].max(t[1]).max(t[2]), cent: (t[0] + t[1] + t[2]) * (1.0 / 3.0) })
+                .collect()
+        } else {
+            tris.iter().map(|t| TriBounds { lo: t[0].min(t[1]).min(t[2]), hi: t[0].max(t[1]).max(t[2]), cent: (t[0] + t[1] + t[2]) * (1.0 / 3.0) }).collect()
+        };
+
+        let mut order: Vec<u32> = (0..tris.len() as u32).collect();
+        let nodes = build_subtree(&mut order, 0, &bounds);
+        let ordered_tris: Vec<[Vec3; 3]> = if order.len() >= PARALLEL_BUILD_MIN {
+            order.par_iter().map(|&t| tris[t as usize]).collect()
+        } else {
+            order.iter().map(|&t| tris[t as usize]).collect()
+        };
+        let tri_edges: Vec<[Vec3; 3]> = if ordered_tris.len() >= PARALLEL_BUILD_MIN {
+            ordered_tris.par_iter().map(|t| [t[0], t[1] - t[0], t[2] - t[0]]).collect()
+        } else {
+            ordered_tris.iter().map(|t| [t[0], t[1] - t[0], t[2] - t[0]]).collect()
+        };
+        Bvh { nodes, tris: ordered_tris, tri_edges, order }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -187,6 +289,7 @@ impl Bvh {
         (&self.tris, &self.order)
     }
 
+    #[inline(always)]
     fn slab(lo: Vec3A, hi: Vec3A, o: Vec3A, inv: Vec3A, tmax: f32) -> Option<f32> {
         let t0 = (lo - o) * inv;
         let t1 = (hi - o) * inv;
@@ -199,16 +302,24 @@ impl Bvh {
     }
 
     /// Möller–Trumbore, double sided.
+    #[cfg(test)]
     fn hit_tri(t: &[Vec3; 3], o: Vec3, d: Vec3) -> Option<(f32, f32, f32)> {
-        let e1 = t[1] - t[0];
-        let e2 = t[2] - t[0];
+        Self::hit_tri_edges(&[t[0], t[1] - t[0], t[2] - t[0]], o, d)
+    }
+
+    /// Möller–Trumbore on precomputed `[v0, e1, e2]`, double sided.
+    #[inline(always)]
+    fn hit_tri_edges(e: &[Vec3; 3], o: Vec3, d: Vec3) -> Option<(f32, f32, f32)> {
+        let v0 = e[0];
+        let e1 = e[1];
+        let e2 = e[2];
         let p = d.cross(e2);
         let det = e1.dot(p);
         if det.abs() < 1e-12 {
             return None;
         }
         let inv = 1.0 / det;
-        let s = o - t[0];
+        let s = o - v0;
         // A little slack on the edges: rays through a shared edge must not slip between its
         // two triangles to a surface behind.
         const EDGE: f32 = 1e-5;
@@ -225,8 +336,9 @@ impl Bvh {
         (tt > 0.0).then_some((tt, u, v))
     }
 
-    fn traverse(&self, o: Vec3, d: Vec3, mut tmax: f32, any: bool, filter: &dyn Fn(u32) -> bool) -> Option<Hit> {
-        let root = self.nodes.first().filter(|_| !self.tris.is_empty())?;
+    #[inline]
+    fn traverse<const ANY: bool, F: Fn(u32) -> bool>(&self, o: Vec3, d: Vec3, mut tmax: f32, filter: F) -> Option<Hit> {
+        let root = self.nodes.first().filter(|_| !self.tri_edges.is_empty())?;
         let (oa, inv) = (Vec3A::from(o), Vec3A::ONE / Vec3A::from(d));
         let mut best = None;
         let mut stack = Stack::default();
@@ -236,15 +348,15 @@ impl Bvh {
             let Some(n) = self.nodes.get(ni as usize).filter(|_| tn <= tmax) else { continue };
             if n.count > 0 {
                 let (f, c) = (n.first as usize, n.count as usize);
-                for i in f..(f + c).min(self.tris.len()) {
-                    let (Some(tri), Some(&orig)) = (self.tris.get(i), self.order.get(i)) else { continue };
-                    if let Some((t, u, v)) = Self::hit_tri(tri, o, d)
+                for i in f..(f + c).min(self.tri_edges.len()) {
+                    let (Some(edge), Some(&orig)) = (self.tri_edges.get(i), self.order.get(i)) else { continue };
+                    if let Some((t, u, v)) = Self::hit_tri_edges(edge, o, d)
                         && t < tmax
                         && filter(orig)
                     {
                         tmax = t;
                         best = Some(Hit { t, tri: orig, u, v });
-                        if any {
+                        if ANY {
                             return best;
                         }
                     }
@@ -274,17 +386,17 @@ impl Bvh {
 
     /// Closest hit along `o + t·d` for `t` in (0, tmax).
     pub fn closest(&self, o: Vec3, d: Vec3, tmax: f32) -> Option<Hit> {
-        self.traverse(o, d, tmax, false, &|_| true)
+        self.traverse::<false, _>(o, d, tmax, |_| true)
     }
 
     /// Closest hit on triangles accepted by `filter` (original triangle index).
     pub fn closest_filtered(&self, o: Vec3, d: Vec3, tmax: f32, filter: &dyn Fn(u32) -> bool) -> Option<Hit> {
-        self.traverse(o, d, tmax, false, filter)
+        self.traverse::<false, _>(o, d, tmax, filter)
     }
 
     /// Whether anything is hit before `tmax` (occlusion rays).
     pub fn occluded(&self, o: Vec3, d: Vec3, tmax: f32) -> bool {
-        self.traverse(o, d, tmax, true, &|_| true).is_some()
+        self.traverse::<true, _>(o, d, tmax, |_| true).is_some()
     }
 
     /// The point nearest to `p` within `max_dist` on a triangle accepted by `filter` (original
@@ -490,5 +602,22 @@ mod tests {
         assert!(!found.is_empty() && found.len() <= 8, "{found:?}");
         let empty = Bvh::new(&Mesh::default());
         assert!(empty.closest(Vec3::ZERO, Vec3::X, 1.0).is_none());
+    }
+
+    #[test]
+    fn parallel_bvh_build_matches_serial_hits_on_large_mesh() {
+        // Subdivide a sphere past PARALLEL_BUILD_MIN (4096) triangles to exercise rayon::join stitching
+        let m = primitives::sphere(1.0, 96, 48);
+        assert!(m.triangle_count() >= PARALLEL_BUILD_MIN);
+        let bvh = Bvh::new(&m);
+        for i in 0..100 {
+            let a = i as f32 * 0.618;
+            let o = Vec3::new(a.cos() * 4.0, (a * 1.3).sin() * 2.0, a.sin() * 4.0);
+            let d = (Vec3::ZERO - o).normalize();
+            let hit = bvh.closest(o, d, 10.0).unwrap();
+            assert!((hit.t - (o.length() - 1.0)).abs() < 0.02, "ray {i}: t={}", hit.t);
+            assert!(bvh.occluded(o, d, hit.t + 0.05));
+            assert!(!bvh.occluded(o, d, hit.t - 0.05));
+        }
     }
 }
