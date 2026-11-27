@@ -17,6 +17,7 @@ use library_placement::LibraryPlacement;
 
 use materialcraft_core::{Package, PatternNodeKind};
 use materialcraft_formats::sbs::{LayoutItem, library};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -136,48 +137,58 @@ impl NodeLibrary {
     pub fn load(files: &[String]) -> NodeLibrary {
         let mut out = NodeLibrary::default();
         let mut seen = BTreeSet::new();
-        for uri in files {
-            if !seen.insert(uri) {
-                continue;
-            }
+        let unique: Vec<&String> = files.iter().filter(|uri| seen.insert(*uri)).collect();
 
+        enum LoadedEntry {
+            Warning(String),
+            Layout { uri: String, placements: Vec<LibraryPlacement> },
+            Package { uri: String, pkg: Arc<Package>, warnings: Vec<String> },
+        }
+
+        let load_one = |uri: &String| -> LoadedEntry {
             let bytes = match library::read(uri) {
                 Ok(bytes) => bytes,
-                Err(error) => {
-                    out.warnings.push(format!("Library package {uri}: {error}"));
-                    continue;
-                }
+                Err(error) => return LoadedEntry::Warning(format!("Library package {uri}: {error}")),
             };
 
             let document = match materialcraft_formats::sbs::SbsDocument::parse(&bytes) {
                 Ok(document) => document,
-                Err(error) => {
-                    out.warnings.push(format!("Library package {uri}: {error}"));
-                    continue;
-                }
+                Err(error) => return LoadedEntry::Warning(format!("Library package {uri}: {error}")),
             };
 
             // Reuse the XML document when the frames do not classify this package as a layout
             let placements = match document.layout(uri) {
                 Ok(frames) => placements(&frames),
-                Err(error) => {
-                    out.warnings.push(format!("Library package {uri}: {error}"));
-                    continue;
-                }
+                Err(error) => return LoadedEntry::Warning(format!("Library package {uri}: {error}")),
             };
             if !placements.is_empty() {
-                out.placements.extend(placements);
-                out.layouts.push(uri.clone());
-                continue;
+                return LoadedEntry::Layout { uri: uri.clone(), placements };
             }
 
             match document.read(uri, &crate::file_cmds::linked_files(uri)) {
                 Ok(mut read) => {
                     crate::linked_files::normalize_references(&mut read.pkg, uri);
-                    out.warnings.extend(read.warnings);
-                    out.packages.insert(uri.clone(), Arc::new(read.pkg));
+                    LoadedEntry::Package { uri: uri.clone(), pkg: Arc::new(read.pkg), warnings: read.warnings }
                 }
-                Err(error) => out.warnings.push(format!("Library package {uri}: {error}")),
+                Err(error) => LoadedEntry::Warning(format!("Library package {uri}: {error}")),
+            }
+        };
+
+        // Parse library packages in parallel while merging results in deterministic input order
+        let loaded: Vec<LoadedEntry> =
+            if unique.len() >= 4 { unique.par_iter().map(|uri| load_one(uri)).collect() } else { unique.iter().map(|uri| load_one(uri)).collect() };
+
+        for entry in loaded {
+            match entry {
+                LoadedEntry::Warning(warning) => out.warnings.push(warning),
+                LoadedEntry::Layout { uri, placements } => {
+                    out.placements.extend(placements);
+                    out.layouts.push(uri);
+                }
+                LoadedEntry::Package { uri, pkg, warnings } => {
+                    out.warnings.extend(warnings);
+                    out.packages.insert(uri, pkg);
+                }
             }
         }
 

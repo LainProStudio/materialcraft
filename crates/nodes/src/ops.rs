@@ -68,6 +68,88 @@ fn convolve_1d(src: &Image, kernel: &[f32], radius: i64, horizontal: bool, tile:
     .unwrap_or_else(|_| src.clone())
 }
 
+/// Cache-blocked parallel transpose of an interleaved `w × h × channels` float buffer to `h × w × channels`.
+pub(crate) fn transpose_f32(src: &[f32], w: usize, h: usize, channels: usize) -> Vec<f32> {
+    const TILE: usize = 32;
+    let mut dst = vec![0.0f32; w * h * channels];
+    if w == 0 || h == 0 {
+        return dst;
+    }
+
+    // Partition output rows (x in 0..w) in TILE-sized bands so every Rayon worker writes disjoint memory
+    let out_row_stride = h * channels;
+    dst.par_chunks_mut(TILE * out_row_stride).enumerate().for_each(|(tx, out_band)| {
+        let x0 = tx * TILE;
+        let x1 = (x0 + TILE).min(w);
+        let tile_w = x1 - x0;
+        for y0 in (0..h).step_by(TILE) {
+            let y1 = (y0 + TILE).min(h);
+            if channels == 1 {
+                for y in y0..y1 {
+                    let src_row = &src[y * w + x0..y * w + x1];
+                    for (dx, &v) in src_row.iter().enumerate() {
+                        out_band[dx * h + y] = v;
+                    }
+                }
+            } else {
+                for y in y0..y1 {
+                    let src_row = &src[(y * w + x0) * channels..(y * w + x1) * channels];
+                    for dx in 0..tile_w {
+                        let s = dx * channels;
+                        let d = (dx * h + y) * channels;
+                        out_band[d..d + channels].copy_from_slice(&src_row[s..s + channels]);
+                    }
+                }
+            }
+        }
+    });
+    dst
+}
+
+/// One horizontal running-sum box pass over contiguous rows of length `line_len` (each pixel has `channels` floats).
+fn box_rows(src: &[f32], dst: &mut [f32], line_len: usize, channels: usize, radius: i64, tile: bool) {
+    let inverse_width = 1.0 / (2 * radius + 1) as f64;
+    let n = line_len as i64;
+    let row_stride = line_len * channels;
+    let r = radius as usize;
+    let interior_fast = line_len > 2 * r + 1;
+
+    dst.par_chunks_mut(row_stride).enumerate().for_each(|(line, out_row)| {
+        let in_row = &src[line * row_stride..(line + 1) * row_stride];
+        let sample = |i: i64, ch: usize| -> f64 {
+            let idx = if tile { i.rem_euclid(n) } else { i.clamp(0, n - 1) } as usize;
+            f64::from(in_row[idx * channels + ch])
+        };
+
+        for ch in 0..channels {
+            let mut sum: f64 = (-radius..=radius).map(|i| sample(i, ch)).sum();
+            if interior_fast {
+                // Left border
+                for i in 0..r {
+                    out_row[i * channels + ch] = (sum * inverse_width) as f32;
+                    sum += f64::from(in_row[(i + r + 1) * channels + ch]) - sample(i as i64 - radius, ch);
+                }
+                // Interior (zero wrap/clamp modulo)
+                let mid_end = line_len - r - 1;
+                for i in r..mid_end {
+                    out_row[i * channels + ch] = (sum * inverse_width) as f32;
+                    sum += f64::from(in_row[(i + r + 1) * channels + ch]) - f64::from(in_row[(i - r) * channels + ch]);
+                }
+                // Right border
+                for i in mid_end..line_len {
+                    out_row[i * channels + ch] = (sum * inverse_width) as f32;
+                    sum += sample(i as i64 + radius + 1, ch) - f64::from(in_row[(i - r) * channels + ch]);
+                }
+            } else {
+                for i in 0..line_len {
+                    out_row[i * channels + ch] = (sum * inverse_width) as f32;
+                    sum += sample(i as i64 + radius + 1, ch) - sample(i as i64 - radius, ch);
+                }
+            }
+        }
+    });
+}
+
 /// One running-sum box pass of radius `radius`.
 fn box_1d(src: &Image, radius: i64, horizontal: bool, tile: bool) -> Image {
     if radius <= 0 {
@@ -76,47 +158,17 @@ fn box_1d(src: &Image, radius: i64, horizontal: bool, tile: bool) -> Image {
 
     let (w, h) = (src.width() as usize, src.height() as usize);
     let channels = src.channels();
-    let inverse_width = 1.0 / (2 * radius + 1) as f64;
-    let mut data = vec![0.0f32; w * h * channels];
-    let line_len = if horizontal { w } else { h };
-    let lines = if horizontal { h } else { w };
-
-    // f64 keeps finite HDR windows from overflowing the running sum
-    let get = |line: usize, i: i64, channel: usize| -> f64 {
-        let n = line_len as i64;
-        let i = if tile { i.rem_euclid(n) } else { i.clamp(0, n - 1) } as usize;
-        let (x, y) = if horizontal { (i, line) } else { (line, i) };
-        f64::from(src.data().get((y * w + x) * channels + channel).copied().unwrap_or(0.0))
-    };
-
-    let fill_line = |line: usize, output: &mut [f32]| {
-        for channel in 0..channels {
-            let mut sum: f64 = (-radius..=radius).map(|i| get(line, i, channel)).sum();
-            for i in 0..line_len {
-                output[i * channels + channel] = (sum * inverse_width) as f32;
-                sum += get(line, i as i64 + radius + 1, channel) - get(line, i as i64 - radius, channel);
-            }
-        }
-    };
-
-    if horizontal {
-        data.par_chunks_mut(w * channels).enumerate().for_each(|(line, output)| fill_line(line, output));
+    let data = if horizontal {
+        let mut out = vec![0.0f32; w * h * channels];
+        box_rows(src.data(), &mut out, w, channels, radius, tile);
+        out
     } else {
-        let results: Vec<Vec<f32>> = (0..lines)
-            .into_par_iter()
-            .map(|line| {
-                let mut output = vec![0.0f32; line_len * channels];
-                fill_line(line, &mut output);
-                output
-            })
-            .collect();
-        for (line, values) in results.into_iter().enumerate() {
-            for i in 0..line_len {
-                let destination = (i * w + line) * channels;
-                data[destination..destination + channels].copy_from_slice(&values[i * channels..i * channels + channels]);
-            }
-        }
-    }
+        let transposed = transpose_f32(src.data(), w, h, channels);
+        let mut blurred = vec![0.0f32; w * h * channels];
+        box_rows(&transposed, &mut blurred, h, channels, radius, tile);
+        drop(transposed);
+        transpose_f32(&blurred, h, w, channels)
+    };
 
     // A valid source has matching dimensions and data length
     Image::from_data(src.width(), src.height(), src.kind(), data, &limits_for(src)).unwrap_or_else(|_| src.clone())
@@ -136,28 +188,46 @@ pub fn distance_sq_with_sites(w: u32, h: u32, inside: impl Fn(usize) -> bool + S
 
 const DISTANCE_INF: f32 = 1e20;
 
-fn edt_1d<const SITES: bool>(f: &[f32]) -> (Vec<f32>, Vec<usize>) {
-    let n = f.len();
+struct EdtScratch {
+    f: Vec<f64>,
+    v: Vec<usize>,
+    z: Vec<f64>,
+}
+
+impl EdtScratch {
+    fn new(cap: usize) -> Self {
+        Self { f: Vec::with_capacity(cap), v: vec![0; cap], z: vec![0.0; cap + 1] }
+    }
+}
+
+fn edt_1d_into<const SITES: bool>(scratch: &mut EdtScratch, n: usize, out_offset: usize, out_d: &mut [f32], out_sites: &mut [usize]) {
     if n == 0 {
-        return (Vec::new(), Vec::new());
+        return;
     }
 
-    let f: Vec<f64> = f.iter().map(|v| *v as f64).collect();
-    let mut d = vec![0.0f32; n];
+    if scratch.v.len() < n {
+        scratch.v.resize(n, 0);
+    }
+    if scratch.z.len() < n + 1 {
+        scratch.z.resize(n + 1, 0.0);
+    }
+    let f = &scratch.f;
+    let v = &mut scratch.v;
+    let z = &mut scratch.z;
 
-    // Distance-only callers do not allocate or propagate site indices
-    let mut sites = if SITES { vec![usize::MAX; n] } else { Vec::new() };
-    let mut v = vec![0usize; n];
-    let mut z = vec![0.0f64; n + 1];
     let mut k = 0usize;
+    v[0] = 0;
     z[0] = -(DISTANCE_INF as f64);
     z[1] = DISTANCE_INF as f64;
-    let cross = |q: usize, p: usize| ((f[q] + (q * q) as f64) - (f[p] + (p * p) as f64)) / (2.0 * q as f64 - 2.0 * p as f64);
     for q in 1..n {
-        let mut s = cross(q, v[k]);
+        let fq_q2 = f[q] + (q * q) as f64;
+        let q2 = 2.0 * q as f64;
+        let mut p = v[k];
+        let mut s = (fq_q2 - (f[p] + (p * p) as f64)) / (q2 - 2.0 * p as f64);
         while k > 0 && s <= z[k] {
             k -= 1;
-            s = cross(q, v[k]);
+            p = v[k];
+            s = (fq_q2 - (f[p] + (p * p) as f64)) / (q2 - 2.0 * p as f64);
         }
         k += 1;
         v[k] = q;
@@ -166,18 +236,21 @@ fn edt_1d<const SITES: bool>(f: &[f32]) -> (Vec<f32>, Vec<usize>) {
     }
 
     k = 0;
-    for (q, dq) in d.iter_mut().enumerate() {
-        while k + 1 < n && z[k + 1] < q as f64 {
+    let out_len = out_d.len();
+    for (idx, dq) in out_d.iter_mut().enumerate() {
+        let q = out_offset + idx;
+        let qf = q as f64;
+        while k + 1 < n && z[k + 1] < qf {
             k += 1;
         }
         let p = v[k];
-        *dq = ((q as f64 - p as f64).powi(2) + f[p]) as f32;
-        if SITES && f[p] < DISTANCE_INF as f64 {
-            sites[q] = p;
+        let diff = qf - p as f64;
+        *dq = (diff * diff + f[p]) as f32;
+        if SITES {
+            out_sites[idx] = if f[p] < DISTANCE_INF as f64 { p } else { usize::MAX };
         }
     }
-
-    (d, sites)
+    let _ = out_len;
 }
 
 fn distance_transform<const SITES: bool>(w: u32, h: u32, inside: impl Fn(usize) -> bool + Sync, tile: bool) -> (Vec<f32>, Vec<usize>) {
@@ -189,49 +262,92 @@ fn distance_transform<const SITES: bool>(w: u32, h: u32, inside: impl Fn(usize) 
     // Tiling: run on a 3x tiled line so distances cross the edges
     let rep = if tile { 3 } else { 1 };
 
-    // Columns. Site indices are vertical coordinates at this stage
-    let cols: Vec<_> = (0..w)
-        .into_par_iter()
-        .map(|x| {
-            let f: Vec<f32> = (0..h * rep).map(|y| if inside((y % h) * w + x) { 0.0 } else { DISTANCE_INF }).collect();
-            let (d, sites) = edt_1d::<SITES>(&f);
-            let off = if tile { h } else { 0 };
-            (d[off..off + h].to_vec(), if SITES { sites[off..off + h].to_vec() } else { Vec::new() })
-        })
-        .collect();
+    // Columns (stored column-major in flat buffers to avoid per-column heap allocations)
+    let mut col_d = vec![0.0f32; w * h];
+    let mut col_s = if SITES { vec![usize::MAX; w * h] } else { Vec::new() };
+    let col_off = if tile { h } else { 0 };
+    let col_n = h * rep;
+    if SITES {
+        col_d.par_chunks_mut(h).zip(col_s.par_chunks_mut(h)).enumerate().for_each_init(
+            || EdtScratch::new(col_n),
+            |scratch, (x, (cd, cs))| {
+                scratch.f.clear();
+                for y in 0..h {
+                    scratch.f.push(if inside(y * w + x) { 0.0 } else { f64::from(DISTANCE_INF) });
+                }
+                if tile {
+                    scratch.f.extend_from_within(0..h);
+                    scratch.f.extend_from_within(0..h);
+                }
+                edt_1d_into::<true>(scratch, col_n, col_off, cd, cs);
+            },
+        );
+    } else {
+        col_d.par_chunks_mut(h).enumerate().for_each_init(
+            || EdtScratch::new(col_n),
+            |scratch, (x, cd)| {
+                scratch.f.clear();
+                for y in 0..h {
+                    scratch.f.push(if inside(y * w + x) { 0.0 } else { f64::from(DISTANCE_INF) });
+                }
+                if tile {
+                    scratch.f.extend_from_within(0..h);
+                    scratch.f.extend_from_within(0..h);
+                }
+                edt_1d_into::<false>(scratch, col_n, col_off, cd, &mut []);
+            },
+        );
+    }
 
-    // Rows. Carry the chosen column's vertical site through the horizontal transform
-    let rows: Vec<_> = (0..h)
-        .into_par_iter()
-        .map(|y| {
-            let f: Vec<f32> = (0..w * rep).map(|x| cols[x % w].0[y]).collect();
-            let (d, sites) = edt_1d::<SITES>(&f);
-            let off = if tile { w } else { 0 };
-            let sites = if SITES {
-                sites[off..off + w]
-                    .iter()
-                    .map(|&x| {
-                        if x == usize::MAX {
-                            usize::MAX
-                        } else {
-                            let x = x % w;
-                            let sy = cols[x].1[y];
-                            if sy == usize::MAX { usize::MAX } else { (sy % h) * w + x }
-                        }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            (d[off..off + w].to_vec(), sites)
-        })
-        .collect();
-    drop(cols);
-    let mut distances = Vec::with_capacity(w * h);
-    let mut sites = if SITES { Vec::with_capacity(w * h) } else { Vec::new() };
-    for (row, row_sites) in rows {
-        distances.extend(row);
-        sites.extend(row_sites);
+    // Transpose column-major distances into row-major so the row pass reads contiguous lines
+    let row_in_d = transpose_f32(&col_d, h, w, 1);
+    drop(col_d);
+
+    let mut distances = vec![0.0f32; w * h];
+    let mut sites = if SITES { vec![usize::MAX; w * h] } else { Vec::new() };
+    let row_off = if tile { w } else { 0 };
+    let row_n = w * rep;
+    if SITES {
+        distances.par_chunks_mut(w).zip(sites.par_chunks_mut(w)).enumerate().for_each_init(
+            || (EdtScratch::new(row_n), vec![usize::MAX; w]),
+            |(scratch, x_sites), (y, (rd, rs))| {
+                scratch.f.clear();
+                let row = &row_in_d[y * w..(y + 1) * w];
+                for &val in row {
+                    scratch.f.push(f64::from(val));
+                }
+                if tile {
+                    scratch.f.extend_from_within(0..w);
+                    scratch.f.extend_from_within(0..w);
+                }
+                edt_1d_into::<true>(scratch, row_n, row_off, rd, x_sites);
+                for (dst, &sx) in rs.iter_mut().zip(x_sites.iter()) {
+                    *dst = if sx == usize::MAX {
+                        usize::MAX
+                    } else {
+                        let x = sx % w;
+                        let sy = col_s[x * h + y];
+                        if sy == usize::MAX { usize::MAX } else { (sy % h) * w + x }
+                    };
+                }
+            },
+        );
+    } else {
+        distances.par_chunks_mut(w).enumerate().for_each_init(
+            || EdtScratch::new(row_n),
+            |scratch, (y, rd)| {
+                scratch.f.clear();
+                let row = &row_in_d[y * w..(y + 1) * w];
+                for &val in row {
+                    scratch.f.push(f64::from(val));
+                }
+                if tile {
+                    scratch.f.extend_from_within(0..w);
+                    scratch.f.extend_from_within(0..w);
+                }
+                edt_1d_into::<false>(scratch, row_n, row_off, rd, &mut []);
+            },
+        );
     }
 
     (distances, sites)
