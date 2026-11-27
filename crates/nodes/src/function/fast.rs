@@ -81,7 +81,6 @@ enum PacketOp {
     MinI { dst: u16, a: u16, b: u16 },
     MaxI { dst: u16, a: u16, b: u16 },
     IntToFloat { dst: u16, a: u16 },
-    FloatToInt { dst: u16, a: u16 },
     And { dst: u16, a: u16, b: u16 },
     Or { dst: u16, a: u16, b: u16 },
     Not { dst: u16, a: u16 },
@@ -496,25 +495,22 @@ impl FastProgram {
                     if ra.dims != want {
                         return None;
                     }
-                    match ra.kind {
-                        RegKind::Float => ra,
-                        RegKind::Int => {
-                            let mut slots = [0u16; 4];
-                            for k in 0..usize::from(want) {
-                                let sa = *ra.slots.get(k)?;
-                                let d = if let Some(va) = b.i_c(sa) {
-                                    b.alloc_f_const(va as f32)?
-                                } else {
-                                    let d = b.alloc_f_dyn()?;
-                                    b.ops.push(PacketOp::IntToFloat { dst: d, a: sa });
-                                    d
-                                };
-                                *slots.get_mut(k)? = d;
-                            }
-                            RegRef { kind: RegKind::Float, dims: want, slots }
-                        }
-                        RegKind::Bool => return None,
+                    if ra.kind != RegKind::Int {
+                        return None;
                     }
+                    let mut slots = [0u16; 4];
+                    for k in 0..usize::from(want) {
+                        let sa = *ra.slots.get(k)?;
+                        let d = if let Some(va) = b.i_c(sa) {
+                            b.alloc_f_const(va as f32)?
+                        } else {
+                            let d = b.alloc_f_dyn()?;
+                            b.ops.push(PacketOp::IntToFloat { dst: d, a: sa });
+                            d
+                        };
+                        *slots.get_mut(k)? = d;
+                    }
+                    RegRef { kind: RegKind::Float, dims: want, slots }
                 }
                 "toint1" | "toint2" | "toint3" | "toint4" => {
                     let ra = in_ref(0)?;
@@ -524,28 +520,22 @@ impl FastProgram {
                         "toint3" => 3,
                         _ => 4,
                     };
-                    if ra.dims != want {
+                    if ra.dims != want || ra.kind != RegKind::Float {
                         return None;
                     }
-                    match ra.kind {
-                        RegKind::Int => ra,
-                        RegKind::Float => {
-                            let mut slots = [0u16; 4];
-                            for k in 0..usize::from(want) {
-                                let sa = *ra.slots.get(k)?;
-                                let d = if let Some(va) = b.f_c(sa) {
-                                    b.alloc_i_const(va as i32)?
-                                } else {
-                                    let d = b.alloc_i_dyn()?;
-                                    b.ops.push(PacketOp::FloatToInt { dst: d, a: sa });
-                                    d
-                                };
-                                *slots.get_mut(k)? = d;
-                            }
-                            RegRef { kind: RegKind::Int, dims: want, slots }
+                    // Only fold finite, in-range float constants using floor() (matching
+                    // `vector::evaluate`). Decline dynamic or out-of-range casts so the
+                    // interpreter retains exact range/NaN errors only on taken branches.
+                    let mut slots = [0u16; 4];
+                    for k in 0..usize::from(want) {
+                        let sa = *ra.slots.get(k)?;
+                        let va = b.f_c(sa)?;
+                        if !va.is_finite() || !(-2_147_483_648.0f32..2_147_483_648.0f32).contains(&va) {
+                            return None;
                         }
-                        RegKind::Bool => return None,
+                        *slots.get_mut(k)? = b.alloc_i_const(va.floor() as i32)?;
                     }
+                    RegRef { kind: RegKind::Int, dims: want, slots }
                 }
                 "mulscalar" => {
                     let ra = in_ref(0)?;
@@ -1230,14 +1220,6 @@ impl FastProgram {
                     }
                     *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
                 }
-                PacketOp::FloatToInt { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let mut out = [0i32; PACKET];
-                    for k in 0..PACKET {
-                        out[k] = va[k] as i32;
-                    }
-                    *ri.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
-                }
                 PacketOp::And { dst, a, b } => {
                     let va = *rb.get(usize::from(a)).ok_or("invalid reg")?;
                     let vb = *rb.get(usize::from(b)).ok_or("invalid reg")?;
@@ -1472,9 +1454,7 @@ fn eliminate_dead_ops(ops: &[PacketOp], output: RegRef, n_f: usize, n_i: usize, 
                 live_f.get(usize::from(dst_x)).copied().unwrap_or(false) || live_f.get(usize::from(dst_y)).copied().unwrap_or(false)
             }
             PacketOp::SampleCol { dst, .. } => dst.iter().any(|&s| live_f.get(usize::from(s)).copied().unwrap_or(false)),
-            PacketOp::SelectI { dst, .. } | PacketOp::MinI { dst, .. } | PacketOp::MaxI { dst, .. } | PacketOp::FloatToInt { dst, .. } => {
-                live_i.get(usize::from(dst)).copied().unwrap_or(false)
-            }
+            PacketOp::SelectI { dst, .. } | PacketOp::MinI { dst, .. } | PacketOp::MaxI { dst, .. } => live_i.get(usize::from(dst)).copied().unwrap_or(false),
             PacketOp::EqF { dst, .. }
             | PacketOp::EqI { dst, .. }
             | PacketOp::EqB { dst, .. }
@@ -1551,7 +1531,6 @@ fn eliminate_dead_ops(ops: &[PacketOp], output: RegRef, n_f: usize, n_i: usize, 
                 mark_i(&mut live_i, b);
             }
             PacketOp::IntToFloat { a, .. } => mark_i(&mut live_i, a),
-            PacketOp::FloatToInt { a, .. } => mark_f(&mut live_f, a),
             PacketOp::EqB { a, b, .. } | PacketOp::And { a, b, .. } | PacketOp::Or { a, b, .. } => {
                 mark_b(&mut live_b, a);
                 mark_b(&mut live_b, b);
@@ -1583,29 +1562,56 @@ fn eliminate_dead_ops(ops: &[PacketOp], output: RegRef, n_f: usize, n_i: usize, 
 }
 
 /// Auto-vectorizable 8-wide Cody-Waite + Cephes minimax `sin` (max error < 3e-7 for |x| <= 4096).
+/// Range fallback is per-lane so no pixel's result depends on its packet neighbors, and `-0.0`
+/// preserves its sign bit.
 #[inline]
 fn sin_simd8(va: [f32; PACKET]) -> [f32; PACKET] {
-    if va.iter().any(|&x| !x.is_finite() || x.abs() > 4096.0) {
-        let mut out = [0.0f32; PACKET];
-        for k in 0..PACKET {
-            out[k] = va[k].sin();
+    let mut safe = [0.0f32; PACKET];
+    let mut any_oob = false;
+    for k in 0..PACKET {
+        let x = va[k];
+        if x.is_finite() && x.abs() <= 4096.0 {
+            safe[k] = x;
+        } else {
+            any_oob = true;
         }
-        return out;
     }
-    trig_simd8(va, 0)
+    let mut out = trig_simd8(safe, 0);
+    for k in 0..PACKET {
+        let x = va[k];
+        if x == 0.0 {
+            out[k] = x;
+        } else if any_oob && (!x.is_finite() || x.abs() > 4096.0) {
+            out[k] = x.sin();
+        }
+    }
+    out
 }
 
 /// Auto-vectorizable 8-wide Cody-Waite + Cephes minimax `cos` (max error < 3e-7 for |x| <= 4096).
+/// Range fallback is per-lane so no pixel's result depends on its packet neighbors.
 #[inline]
 fn cos_simd8(va: [f32; PACKET]) -> [f32; PACKET] {
-    if va.iter().any(|&x| !x.is_finite() || x.abs() > 4096.0) {
-        let mut out = [0.0f32; PACKET];
-        for k in 0..PACKET {
-            out[k] = va[k].cos();
+    let mut safe = [0.0f32; PACKET];
+    let mut any_oob = false;
+    for k in 0..PACKET {
+        let x = va[k];
+        if x.is_finite() && x.abs() <= 4096.0 {
+            safe[k] = x;
+        } else {
+            any_oob = true;
         }
-        return out;
     }
-    trig_simd8(va, 1)
+    let mut out = trig_simd8(safe, 1);
+    if any_oob {
+        for k in 0..PACKET {
+            let x = va[k];
+            if !x.is_finite() || x.abs() > 4096.0 {
+                out[k] = x.cos();
+            }
+        }
+    }
+    out
 }
 
 #[inline]
@@ -1843,5 +1849,78 @@ mod tests {
         let mut out_bool = [0.0f32; 1];
         fast_bool.eval_packet(&mut fast_bool.new_regs(), [0.5; PACKET], 0.5, &pctx, 1, &mut out_bool).expect("eval");
         assert_eq!(out_bool[0], 0.75);
+    }
+
+    #[test]
+    fn fast_casts_floor_negative_constants_and_decline_invalid_or_dynamic_float_to_int() {
+        let vars = BTreeMap::new();
+        let pctx = PacketCtx { images: &[], tile: true, gray: true, format: OutputFormat::F32, channels: 1 };
+
+        // 1. tofloat(toint1(-0.5)) floors to -1.0 (not 0.0).
+        let floor_cast = FunctionGraph {
+            nodes: vec![n(1, "const_float1", &[], Some(Value::Float(-0.5))), n(2, "toint1", &[1], None), n(3, "tofloat", &[2], None)],
+            output: Some(3),
+            ..FunctionGraph::default()
+        };
+        let prog = compile(&floor_cast, 0).expect("compile");
+        let fast = FastProgram::try_compile(&prog, &vars, [8.0, 8.0], true).expect("const floor cast compiles");
+        let mut out = [0.0f32; 1];
+        fast.eval_packet(&mut fast.new_regs(), [0.5; PACKET], 0.5, &pctx, 1, &mut out).expect("eval");
+        assert_eq!(out[0], -1.0);
+
+        // 2. Identity casts (tofloat on float, toint1 on int) decline fast compilation.
+        let id_float = FunctionGraph {
+            nodes: vec![n(1, "const_float1", &[], Some(Value::Float(0.25))), n(2, "tofloat", &[1], None)],
+            output: Some(2),
+            ..FunctionGraph::default()
+        };
+        assert!(FastProgram::try_compile(&compile(&id_float, 0).expect("compile"), &vars, [8.0, 8.0], true).is_none());
+
+        let id_int = FunctionGraph {
+            nodes: vec![n(1, "const_int1", &[], Some(Value::Int(7))), n(2, "toint1", &[1], None), n(3, "tofloat", &[2], None)],
+            output: Some(3),
+            ..FunctionGraph::default()
+        };
+        assert!(FastProgram::try_compile(&compile(&id_int, 0).expect("compile"), &vars, [8.0, 8.0], true).is_none());
+
+        // 3. Out-of-range constant and dynamic float-to-int casts decline fast compilation.
+        let oob = FunctionGraph {
+            nodes: vec![n(1, "const_float1", &[], Some(Value::Float(2_147_483_648.0))), n(2, "toint1", &[1], None), n(3, "tofloat", &[2], None)],
+            output: Some(3),
+            ..FunctionGraph::default()
+        };
+        assert!(FastProgram::try_compile(&compile(&oob, 0).expect("compile"), &vars, [8.0, 8.0], true).is_none());
+
+        let dyn_cast = FunctionGraph {
+            nodes: vec![
+                n(1, "get_float2", &[], Some(Value::Text("$pos".into()))),
+                n(2, "swizzle1", &[1], Some(Value::Int(0))),
+                n(3, "toint1", &[2], None),
+                n(4, "tofloat", &[3], None),
+            ],
+            output: Some(4),
+            ..FunctionGraph::default()
+        };
+        assert!(FastProgram::try_compile(&compile(&dyn_cast, 0).expect("compile"), &vars, [8.0, 8.0], true).is_none());
+    }
+
+    #[test]
+    fn simd8_trig_is_lane_independent_and_preserves_negative_zero() {
+        let probe = 4.712_389_f32;
+        let all_in_range = [probe; PACKET];
+        let mut mixed = [probe; PACKET];
+        mixed[7] = 1.0e9;
+        mixed[6] = f32::NAN;
+        assert_eq!(cos_simd8(all_in_range)[0].to_bits(), cos_simd8(mixed)[0].to_bits());
+        assert_eq!(sin_simd8(all_in_range)[0].to_bits(), sin_simd8(mixed)[0].to_bits());
+        assert!(cos_simd8(mixed)[6].is_nan());
+        assert_eq!(cos_simd8(mixed)[7].to_bits(), 1.0e9_f32.cos().to_bits());
+
+        let mut zeros = [0.0f32; PACKET];
+        zeros[0] = -0.0;
+        zeros[1] = 0.0;
+        let s = sin_simd8(zeros);
+        assert_eq!(s[0].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(s[1].to_bits(), (0.0f32).to_bits());
     }
 }
