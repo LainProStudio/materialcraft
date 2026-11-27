@@ -13,7 +13,7 @@ pub struct EvaluationContext<'a> {
 }
 
 impl EvaluationContext<'_> {
-    pub(super) fn variable(&self, name: &str, local: &BTreeMap<String, Value>) -> Result<Option<Value>, String> {
+    pub(crate) fn variable(&self, name: &str, local: &BTreeMap<String, Value>) -> Result<Option<Value>, String> {
         if let Some(variable) = super::SystemVariable::named(name) {
             // A local name must never make a system variable available outside its caller's scope
             return variable.resolve(self);

@@ -1,7 +1,7 @@
 mod catalog;
 mod evaluation;
+mod fx_program;
 mod pattern_stamp;
-mod pattern_visit;
 mod raster;
 mod region;
 mod shape;

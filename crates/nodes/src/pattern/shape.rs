@@ -1,7 +1,8 @@
-pub(super) fn coverage(pattern: i32, x: f32, y: f32, variation: f32) -> Result<f32, String> {
+#[inline]
+pub(super) fn coverage_validated(pattern: i32, x: f32, y: f32, variation: f32) -> f32 {
     let radius_squared = x * x + y * y;
     let radial = (1.0 - radius_squared).max(0.0);
-    let value = match pattern - 1 {
+    match pattern - 1 {
         1 => 1.0,
         2 => {
             if radius_squared <= 1.0 {
@@ -40,8 +41,6 @@ pub(super) fn coverage(pattern: i32, x: f32, y: f32, variation: f32) -> Result<f
         15 => (1.0 - radius_squared.sqrt()).max(0.0),
         16 => radial.sqrt(),
         17 => ((x + 1.0) * 0.5 + variation).fract(),
-        _ => return Err(format!("unknown built-in pattern {pattern}")),
-    };
-
-    Ok(value)
+        _ => 0.0,
+    }
 }

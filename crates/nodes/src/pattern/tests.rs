@@ -371,3 +371,156 @@ fn a_pixel_on_the_seam_of_two_patterns_is_drawn_once() {
     assert_eq!(image.get(0, 0, false)[0], 1.0);
     assert_eq!(image.get(1, 1, false)[0], 1.0);
 }
+
+#[test]
+fn compiled_fx_program_matches_interpreter_with_rand_and_system_vars() {
+    use crate::function::{EvaluationContext, EvaluationState, FunctionScope, compile};
+    use crate::pattern::fx_program::{FxProgram, FxRegs, FxVarSchema, FxVisitInputs};
+
+    // Compute: rand(1.0) * (0.25 + $pos.x * $depthpow2 + $depth * 0.1 + $number * 0.05)
+    let mut graph = FunctionGraph::default();
+    let one = graph.add_constant(Value::Float(1.0));
+    let r = graph.add("rand", &[one], None);
+    let pos = graph.add("get_float2", &[], Some(Value::Text("$pos".into())));
+    let px = graph.add("swizzle1", &[pos], Some(Value::Int(0)));
+    let extent = graph.add("get_float1", &[], Some(Value::Text("$depthpow2".into())));
+    let depth = graph.add("get_float1", &[], Some(Value::Text("$depth".into())));
+    let number = graph.add("get_float1", &[], Some(Value::Text("$number".into())));
+    let c025 = graph.add_constant(Value::Float(0.25));
+    let c01 = graph.add_constant(Value::Float(0.1));
+    let c005 = graph.add_constant(Value::Float(0.05));
+    let t1 = graph.add("mul", &[px, extent], None);
+    let t2 = graph.add("mul", &[depth, c01], None);
+    let t3 = graph.add("mul", &[number, c005], None);
+    let s1 = graph.add("add", &[c025, t1], None);
+    let s2 = graph.add("add", &[s1, t2], None);
+    let s3 = graph.add("add", &[s2, t3], None);
+    graph.output = Some(graph.add("mul", &[r, s3], None));
+
+    let program = compile(&graph, 123).unwrap();
+    let vars = BTreeMap::new();
+    let schema = FxVarSchema::collect([&program], &vars);
+    let fast = FxProgram::try_compile(&program, &vars, [256.0, 256.0], true, &schema).unwrap();
+
+    let mut regs = FxRegs::default();
+    let mut fx_vars = schema.new_store();
+    let mut state = EvaluationState::default();
+    let mut rng_fast = 42_u32;
+    let mut rng_slow = 42_u32;
+    for step in 0..16_u32 {
+        let pos = [step as f32 / 16.0, 0.375];
+        let depth = (step % 5) as f32;
+        let extent = 0.5_f32.powi((step % 5) as i32);
+        let number = step as f32;
+        let got = fast.eval(&mut regs, &mut fx_vars, &FxVisitInputs { pos, depth, extent, number, seed: 42 }, &mut rng_fast, &[], true).unwrap().as_f32();
+        let mut slow_vars = BTreeMap::new();
+        slow_vars.insert("$randomseed".into(), Value::Int(42));
+        slow_vars.insert("$depth".into(), Value::Float(depth));
+        slow_vars.insert("$depthpow2".into(), Value::Float(extent));
+        slow_vars.insert("$number".into(), Value::Float(number));
+        let eval_ctx = EvaluationContext { scope: FunctionScope::FxMap, position: pos, size: [256.0, 256.0], images: &[], tile: true, variables: &slow_vars };
+        let expected = program.evaluate_with_random(&eval_ctx, &mut state, &mut rng_slow).unwrap().as_f32().unwrap();
+        assert_eq!(got.to_bits(), expected.to_bits(), "step {step}: {got} vs {expected}");
+        assert_eq!(rng_fast, rng_slow, "step {step} rng diverged");
+    }
+}
+
+#[test]
+fn compiled_fx_program_short_circuits_ifelse_rand_and_persists_set() {
+    use crate::function::{EvaluationContext, EvaluationState, FunctionScope, compile};
+    use crate::pattern::fx_program::{FxProgram, FxRegs, FxVarSchema, FxVisitInputs};
+
+    // If $pos.x < 0.5: set(acc = get(acc) + rand(1.0)), else: set(acc = get(acc) + 0.125)
+    // Only the taken branch should advance the RNG stream and mutate `acc`
+    let mut graph = FunctionGraph::default();
+    let pos = graph.add("get_float2", &[], Some(Value::Text("$pos".into())));
+    let px = graph.add("swizzle1", &[pos], Some(Value::Int(0)));
+    let half = graph.add_constant(Value::Float(0.5));
+    let cond = graph.add("lr", &[px, half], None);
+
+    let acc_t = graph.add("get_float1", &[], Some(Value::Text("acc".into())));
+    let one = graph.add_constant(Value::Float(1.0));
+    let r = graph.add("rand", &[one], None);
+    let sum_t = graph.add("add", &[acc_t, r], None);
+    let set_t = graph.add("set", &[sum_t], Some(Value::Text("acc".into())));
+
+    let acc_e = graph.add("get_float1", &[], Some(Value::Text("acc".into())));
+    let step = graph.add_constant(Value::Float(0.125));
+    let sum_e = graph.add("add", &[acc_e, step], None);
+    let set_e = graph.add("set", &[sum_e], Some(Value::Text("acc".into())));
+
+    graph.output = Some(graph.add("ifelse", &[cond, set_t, set_e], None));
+
+    let program = compile(&graph, 9).unwrap();
+    let vars = BTreeMap::from([("acc".into(), Value::Float(0.25))]);
+    let schema = FxVarSchema::collect([&program], &vars);
+    let fast = FxProgram::try_compile(&program, &vars, [256.0, 256.0], true, &schema).unwrap();
+
+    let mut regs = FxRegs::default();
+    let mut fx_vars = schema.new_store();
+    let mut state = EvaluationState::default();
+    let mut slow_vars = vars.clone();
+    let mut rng_fast = 77_u32;
+    let mut rng_slow = 77_u32;
+    for step in 0..16_u32 {
+        let pos = [if step % 2 == 0 { 0.25 } else { 0.75 }, 0.5];
+        let got = fast
+            .eval(&mut regs, &mut fx_vars, &FxVisitInputs { pos, depth: 1.0, extent: 0.5, number: step as f32, seed: 77 }, &mut rng_fast, &[], true)
+            .unwrap()
+            .as_f32();
+        slow_vars.insert("$randomseed".into(), Value::Int(77));
+        slow_vars.insert("$depth".into(), Value::Float(1.0));
+        slow_vars.insert("$depthpow2".into(), Value::Float(0.5));
+        slow_vars.insert("$number".into(), Value::Float(step as f32));
+        let eval_ctx = EvaluationContext { scope: FunctionScope::FxMap, position: pos, size: [256.0, 256.0], images: &[], tile: true, variables: &slow_vars };
+        let expected = program.evaluate_with_random(&eval_ctx, &mut state, &mut rng_slow).unwrap().as_f32().unwrap();
+        for (k, v) in state.assignments() {
+            slow_vars.insert(k.clone(), v.clone());
+        }
+        assert_eq!(got.to_bits(), expected.to_bits(), "step {step}: {got} vs {expected}");
+        assert_eq!(rng_fast, rng_slow, "step {step} rng diverged");
+    }
+}
+
+#[test]
+fn parallel_band_rasterizer_matches_rotated_color_blends_across_bands() {
+    let mut graph = PatternGraph::with_root(PatternNodeKind::Quadrant);
+    let child = graph.add(PatternNodeKind::Quadrant).unwrap();
+    graph.nodes[0].children = vec![Some(child); 4];
+    graph.nodes[1].parameters.insert("patterntype".into(), Value::Int(6));
+    graph.nodes[1].parameters.insert("patternrotation".into(), Value::Float(0.17));
+    graph.nodes[1].parameters.insert("patternsize".into(), Value::Float2([1.6, 1.2]));
+    graph.nodes[1].parameters.insert("opacity".into(), Value::Float4([0.9, 0.5, 0.25, 0.8]));
+    graph.nodes[1].parameters.insert("blendingmode".into(), Value::Int(1));
+
+    let definition = find("fx_map").unwrap();
+    let parameters = resolve_params(
+        definition,
+        &BTreeMap::from([
+            ("pattern".into(), Value::PatternGraph(Box::new(graph))),
+            ("roughness".into(), Value::Float(0.5)),
+            ("color_mode".into(), Value::Bool(true)),
+            ("background".into(), Value::Color([0.05, 0.05, 0.05, 1.0])),
+        ]),
+    );
+    let context = CookContext {
+        format: materialcraft_core::OutputFormat::F32,
+        w: 128,
+        h: 128,
+        seed: 19,
+        tile: true,
+        inputs: &[],
+        params: &parameters,
+        resource: &|_| None,
+        vars: &BTreeMap::new(),
+    };
+
+    let image = (definition.cook)(&context).unwrap().remove(0);
+    // Symmetric quadrant layout produces matching pixel values across the 16-row band boundaries
+    let a = image.get(32, 32, false);
+    let b = image.get(96, 96, false);
+    for c in 0..4 {
+        assert!((a[c] - b[c]).abs() < 1e-5, "channel {c}: {a:?} vs {b:?}");
+    }
+    assert!(a[0] > a[1] && a[1] > a[2], "red-dominant tint preserved: {a:?}");
+}
