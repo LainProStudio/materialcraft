@@ -56,6 +56,9 @@ pub struct Session {
     pub(crate) linked_sources: std::collections::BTreeMap<String, Arc<Package>>,
     /// Snapshots inserted by the library, excluding explicitly supplied dependencies
     pub(crate) library_sources: std::collections::BTreeMap<String, Arc<Package>>,
+    /// Cached `linked_sources` pointers and paths whose interfaces were already verified clean
+    pub(crate) resolved_links_snapshot: Vec<(String, Arc<Package>)>,
+    pub(crate) resolved_links: std::collections::BTreeSet<String>,
     pub pkg: Package,
     /// Where the package was opened from or last saved to.
     pub path: Option<String>,
@@ -133,6 +136,8 @@ impl Session {
             documents: std::collections::BTreeMap::new(),
             linked_sources: pkg.dependencies.clone(),
             library_sources,
+            resolved_links_snapshot: Vec::new(),
+            resolved_links: std::collections::BTreeSet::new(),
             material_preview: crate::MaterialPreview::for_graph(&pkg, 0),
             cooked_graph: None,
             material_cooked: std::collections::BTreeMap::new(),

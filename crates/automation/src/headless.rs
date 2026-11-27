@@ -123,15 +123,26 @@ impl Headless {
 
     /// Run `[{id, params?}]` in order, stopping at the first error (reported with its index)
     pub fn batch(&mut self, steps: &[Value]) -> Value {
+        let grouped = steps.len() > 1;
+        if grouped {
+            self.session.begin_group("Batch");
+        }
         let mut results = Vec::new();
+        let mut failed = None;
         for (i, step) in steps.iter().enumerate() {
             let id = step.get("id").and_then(Value::as_str).unwrap_or_default();
             match self.command_run(id, step.get("params").cloned().unwrap_or(Value::Null)) {
                 Ok(v) => results.push(v),
-                Err(e) => return batch_reply(results, Some((i, id, e.to_string()))),
+                Err(e) => {
+                    failed = Some((i, id, e.to_string()));
+                    break;
+                }
             }
         }
-        batch_reply(results, None)
+        if grouped {
+            self.session.end_group();
+        }
+        batch_reply(results, failed)
     }
 
     /// Open an `.sbs` or `.mcraft` package (or a `.mcmat` material's source), using the granted file access
