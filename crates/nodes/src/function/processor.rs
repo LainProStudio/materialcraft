@@ -45,21 +45,27 @@ pub(crate) fn pixel_processor(context: &CookContext) -> CookResult {
     let mut data = vec![0.0; width as usize * height as usize * channels];
     if let Some(fast) = super::fast::FastProgram::try_compile(&program, context.vars, [width as f32, height as f32], context.tile) {
         const PACKET: usize = super::fast::PACKET;
+        const ROWS_PER_BAND: usize = 16;
+        let row_floats = width as usize * channels;
+        let band_rows = if height as usize >= ROWS_PER_BAND * 2 { ROWS_PER_BAND } else { 1 };
         let pctx = super::fast::PacketCtx { images: context.inputs, tile: context.tile, gray, format: context.format, channels };
-        data.par_chunks_mut(width as usize * channels).enumerate().try_for_each_init(
+        data.par_chunks_mut(band_rows * row_floats).enumerate().try_for_each_init(
             || fast.new_regs(),
-            |regs, (y, row)| -> Result<(), String> {
-                let py = (y as f32 + 0.5) / height as f32;
-                let mut x = 0usize;
-                for target in row.chunks_mut(PACKET * channels) {
-                    let count = target.len() / channels;
-                    let mut px = [0.0f32; PACKET];
-                    for (k, slot) in px.iter_mut().enumerate() {
-                        let xi = if k < count { x + k } else { x + count.saturating_sub(1) };
-                        *slot = (xi as f32 + 0.5) / width as f32;
+            |regs, (band_idx, band)| -> Result<(), String> {
+                let y_base = band_idx * band_rows;
+                for (dy, row) in band.chunks_exact_mut(row_floats).enumerate() {
+                    let py = ((y_base + dy) as f32 + 0.5) / height as f32;
+                    let mut x = 0usize;
+                    for target in row.chunks_mut(PACKET * channels) {
+                        let count = target.len() / channels;
+                        let mut px = [0.0f32; PACKET];
+                        for (k, slot) in px.iter_mut().enumerate() {
+                            let xi = if k < count { x + k } else { x + count.saturating_sub(1) };
+                            *slot = (xi as f32 + 0.5) / width as f32;
+                        }
+                        fast.eval_packet(regs, px, py, &pctx, count, target)?;
+                        x += count;
                     }
-                    fast.eval_packet(regs, px, py, &pctx, count, target)?;
-                    x += count;
                 }
                 Ok(())
             },

@@ -1,6 +1,10 @@
 use craft_texture::{Image, Limits};
 use materialcraft_core::OutputFormat;
+use rayon::prelude::*;
 use std::sync::Arc;
+
+const MIN_PARALLEL_FLOATS: usize = 65_536;
+const PARALLEL_CHUNK_FLOATS: usize = 16_384;
 
 pub(crate) fn apply(image: Image, format: OutputFormat) -> Image {
     const HALF_FLOAT_MAX: f32 = 65504.0;
@@ -40,7 +44,7 @@ pub(crate) fn integer_sampling(format: OutputFormat) -> bool {
 
 /// `image` with `convert` applied to every float and the integer-sampling flag set. The buffer is
 /// changed in place when no other image shares it, and copied once otherwise.
-fn with_pixels(image: Image, integer_sampling: bool, convert: impl Fn(&mut f32)) -> Image {
+fn with_pixels(image: Image, integer_sampling: bool, convert: impl Fn(&mut f32) + Sync) -> Image {
     let (width, height, kind) = (image.width(), image.height(), image.kind());
 
     // Limits that admit any valid image, so one made with raised limits keeps its size
@@ -52,7 +56,12 @@ fn with_pixels(image: Image, integer_sampling: bool, convert: impl Fn(&mut f32))
     let mut data = Arc::clone(image.shared_data());
     drop(image);
 
-    Arc::make_mut(&mut data).iter_mut().for_each(convert);
+    let pixels = Arc::make_mut(&mut data);
+    if pixels.len() >= MIN_PARALLEL_FLOATS {
+        pixels.par_chunks_mut(PARALLEL_CHUNK_FLOATS).for_each(|chunk| chunk.iter_mut().for_each(&convert));
+    } else {
+        pixels.iter_mut().for_each(convert);
+    }
 
     // `data` keeps the size and kind of a valid image, so `from_data` accepts it
     Image::from_data(width, height, kind, data, &limits)

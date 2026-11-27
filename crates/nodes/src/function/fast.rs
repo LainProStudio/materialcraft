@@ -854,7 +854,7 @@ impl FastProgram {
         let _ = (dimensions, floats);
 
         let ops = eliminate_dead_ops(&b.ops, output, b.f_init.len(), b.i_init.len(), b.b_init.len());
-        Some(Self { ops, f_init: b.f_init, i_init: b.i_init, b_init: b.b_init, pos_x, pos_y, output })
+        compact_and_allocate_regs(ops, &b.f_init, &b.f_const, &b.i_init, &b.i_const, &b.b_init, &b.b_const, pos_x, pos_y, output)
     }
 
     pub(crate) fn new_regs(&self) -> FastRegs {
@@ -882,451 +882,408 @@ impl FastProgram {
         let gray = ctx.gray;
         let format = ctx.format;
         let channels = ctx.channels;
-        if let Some(slot) = regs.f.get_mut(usize::from(self.pos_x)) {
-            *slot = px;
-        }
-        if let Some(slot) = regs.f.get_mut(usize::from(self.pos_y)) {
-            *slot = [py; PACKET];
+        if regs.f.len() < self.f_init.len() || regs.i.len() < self.i_init.len() || regs.b.len() < self.b_init.len() {
+            return Err("invalid reg".into());
         }
 
-        let rf = &mut regs.f;
-        let ri = &mut regs.i;
-        let rb = &mut regs.b;
+        let rf = &mut regs.f[..self.f_init.len()];
+        let ri = &mut regs.i[..self.i_init.len()];
+        let rb = &mut regs.b[..self.b_init.len()];
+        rf[usize::from(self.pos_x)] = px;
+        rf[usize::from(self.pos_y)] = [py; PACKET];
 
         for &op in &self.ops {
             match op {
                 PacketOp::NegF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = -va[k];
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::AbsF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].abs();
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::FloorF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let mut out = [0.0f32; PACKET];
-                    for k in 0..PACKET {
-                        out[k] = va[k].floor();
-                    }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = floor_simd8(rf[usize::from(a)]);
                 }
                 PacketOp::FractF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let mut out = [0.0f32; PACKET];
-                    for k in 0..PACKET {
-                        out[k] = va[k] - va[k].floor();
-                    }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = fract_simd8(rf[usize::from(a)]);
                 }
                 PacketOp::CeilF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let mut out = [0.0f32; PACKET];
-                    for k in 0..PACKET {
-                        out[k] = va[k].ceil();
-                    }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = ceil_simd8(rf[usize::from(a)]);
                 }
                 PacketOp::SqrtF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].sqrt();
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::ExpF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].exp();
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::LogF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].ln();
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::Log2F { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].log2();
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::Pow2F { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].exp2();
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::SinF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = sin_simd8(va);
+                    rf[usize::from(dst)] = sin_simd8(rf[usize::from(a)]);
                 }
                 PacketOp::CosF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = cos_simd8(va);
+                    rf[usize::from(dst)] = cos_simd8(rf[usize::from(a)]);
                 }
                 PacketOp::TanF { dst, a } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].tan();
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::AddF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] + vb[k];
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::SubF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] - vb[k];
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::MulF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] * vb[k];
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::DivF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] / vb[k];
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::ModF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
+                    let mut q = [0.0f32; PACKET];
+                    for k in 0..PACKET {
+                        q[k] = va[k] / vb[k];
+                    }
+                    let fq = floor_simd8(q);
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
-                        out[k] = va[k] - vb[k] * (va[k] / vb[k]).floor();
+                        out[k] = va[k] - vb[k] * fq[k];
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::MinF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].min(vb[k]);
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::MaxF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].max(vb[k]);
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::PowF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].powf(vb[k]);
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::Atan2F { dst, y, x } => {
-                    let vy = *rf.get(usize::from(y)).ok_or("invalid reg")?;
-                    let vx = *rf.get(usize::from(x)).ok_or("invalid reg")?;
+                    let vy = rf[usize::from(y)];
+                    let vx = rf[usize::from(x)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = vy[k].atan2(vx[k]);
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::CartesianF { dst_x, dst_y, r, ang } => {
-                    let vr = *rf.get(usize::from(r)).ok_or("invalid reg")?;
-                    let va = *rf.get(usize::from(ang)).ok_or("invalid reg")?;
+                    let vr = rf[usize::from(r)];
+                    let va = rf[usize::from(ang)];
+                    let sv = sin_simd8(va);
+                    let cv = cos_simd8(va);
                     let mut ox = [0.0f32; PACKET];
                     let mut oy = [0.0f32; PACKET];
                     for k in 0..PACKET {
-                        let (s, c) = va[k].sin_cos();
-                        ox[k] = vr[k] * c;
-                        oy[k] = vr[k] * s;
+                        ox[k] = vr[k] * cv[k];
+                        oy[k] = vr[k] * sv[k];
                     }
-                    *rf.get_mut(usize::from(dst_x)).ok_or("invalid reg")? = ox;
-                    *rf.get_mut(usize::from(dst_y)).ok_or("invalid reg")? = oy;
+                    rf[usize::from(dst_x)] = ox;
+                    rf[usize::from(dst_y)] = oy;
                 }
                 PacketOp::LerpF { dst, a, b, t } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
-                    let vt = *rf.get(usize::from(t)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
+                    let vt = rf[usize::from(t)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] + (vb[k] - va[k]) * vt[k];
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::EqF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] == vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::EqI { dst, a, b } => {
-                    let va = *ri.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *ri.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = ri[usize::from(a)];
+                    let vb = ri[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] == vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::EqB { dst, a, b } => {
-                    let va = *rb.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rb.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rb[usize::from(a)];
+                    let vb = rb[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] == vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::GtF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] > vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::GtEqF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] >= vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::LrF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] < vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::LrEqF { dst, a, b } => {
-                    let va = *rf.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rf.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rf[usize::from(a)];
+                    let vb = rf[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] <= vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::GtI { dst, a, b } => {
-                    let va = *ri.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *ri.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = ri[usize::from(a)];
+                    let vb = ri[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] > vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::GtEqI { dst, a, b } => {
-                    let va = *ri.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *ri.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = ri[usize::from(a)];
+                    let vb = ri[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] >= vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::LrI { dst, a, b } => {
-                    let va = *ri.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *ri.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = ri[usize::from(a)];
+                    let vb = ri[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] < vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::LrEqI { dst, a, b } => {
-                    let va = *ri.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *ri.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = ri[usize::from(a)];
+                    let vb = ri[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] <= vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::MinI { dst, a, b } => {
-                    let va = *ri.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *ri.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = ri[usize::from(a)];
+                    let vb = ri[usize::from(b)];
                     let mut out = [0i32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].min(vb[k]);
                     }
-                    *ri.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    ri[usize::from(dst)] = out;
                 }
                 PacketOp::MaxI { dst, a, b } => {
-                    let va = *ri.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *ri.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = ri[usize::from(a)];
+                    let vb = ri[usize::from(b)];
                     let mut out = [0i32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k].max(vb[k]);
                     }
-                    *ri.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    ri[usize::from(dst)] = out;
                 }
                 PacketOp::IntToFloat { dst, a } => {
-                    let va = *ri.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = ri[usize::from(a)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] as f32;
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::And { dst, a, b } => {
-                    let va = *rb.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rb.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rb[usize::from(a)];
+                    let vb = rb[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] && vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::Or { dst, a, b } => {
-                    let va = *rb.get(usize::from(a)).ok_or("invalid reg")?;
-                    let vb = *rb.get(usize::from(b)).ok_or("invalid reg")?;
+                    let va = rb[usize::from(a)];
+                    let vb = rb[usize::from(b)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = va[k] || vb[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::Not { dst, a } => {
-                    let va = *rb.get(usize::from(a)).ok_or("invalid reg")?;
+                    let va = rb[usize::from(a)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = !va[k];
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::SelectF { dst, c, t, e } => {
-                    let vc = *rb.get(usize::from(c)).ok_or("invalid reg")?;
-                    let vt = *rf.get(usize::from(t)).ok_or("invalid reg")?;
-                    let ve = *rf.get(usize::from(e)).ok_or("invalid reg")?;
+                    let vc = rb[usize::from(c)];
+                    let vt = rf[usize::from(t)];
+                    let ve = rf[usize::from(e)];
                     let mut out = [0.0f32; PACKET];
                     for k in 0..PACKET {
                         out[k] = if vc[k] { vt[k] } else { ve[k] };
                     }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::SelectI { dst, c, t, e } => {
-                    let vc = *rb.get(usize::from(c)).ok_or("invalid reg")?;
-                    let vt = *ri.get(usize::from(t)).ok_or("invalid reg")?;
-                    let ve = *ri.get(usize::from(e)).ok_or("invalid reg")?;
+                    let vc = rb[usize::from(c)];
+                    let vt = ri[usize::from(t)];
+                    let ve = ri[usize::from(e)];
                     let mut out = [0i32; PACKET];
                     for k in 0..PACKET {
                         out[k] = if vc[k] { vt[k] } else { ve[k] };
                     }
-                    *ri.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    ri[usize::from(dst)] = out;
                 }
                 PacketOp::SelectB { dst, c, t, e } => {
-                    let vc = *rb.get(usize::from(c)).ok_or("invalid reg")?;
-                    let vt = *rb.get(usize::from(t)).ok_or("invalid reg")?;
-                    let ve = *rb.get(usize::from(e)).ok_or("invalid reg")?;
+                    let vc = rb[usize::from(c)];
+                    let vt = rb[usize::from(t)];
+                    let ve = rb[usize::from(e)];
                     let mut out = [false; PACKET];
                     for k in 0..PACKET {
                         out[k] = if vc[k] { vt[k] } else { ve[k] };
                     }
-                    *rb.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    rb[usize::from(dst)] = out;
                 }
                 PacketOp::SampleLum { dst, u, v, index, bilinear } => {
-                    let vu = *rf.get(usize::from(u)).ok_or("invalid reg")?;
-                    let vv = *rf.get(usize::from(v)).ok_or("invalid reg")?;
-                    let mut out = [0.0f32; PACKET];
-                    if let Some(image) = images.get(usize::from(index)).and_then(Option::as_ref) {
-                        if !bilinear {
-                            let w = image.width() as f32;
-                            let h = image.height() as f32;
-                            for k in 0..count {
-                                out[k] = image.get((vu[k] * w).floor() as i64, (vv[k] * h).floor() as i64, tile)[0];
-                            }
-                        } else {
-                            for k in 0..count {
-                                out[k] = image.sample_stored(vu[k], vv[k], tile)[0];
-                            }
-                        }
-                    }
-                    *rf.get_mut(usize::from(dst)).ok_or("invalid reg")? = out;
+                    let vu = rf[usize::from(u)];
+                    let vv = rf[usize::from(v)];
+                    let out = match images.get(usize::from(index)).and_then(Option::as_ref) {
+                        Some(image) => sample_lum_packet(image, vu, vv, tile, bilinear, count),
+                        None => [0.0f32; PACKET],
+                    };
+                    rf[usize::from(dst)] = out;
                 }
                 PacketOp::SampleCol { dst, u, v, index, bilinear } => {
-                    let vu = *rf.get(usize::from(u)).ok_or("invalid reg")?;
-                    let vv = *rf.get(usize::from(v)).ok_or("invalid reg")?;
-                    let mut o0 = [0.0f32; PACKET];
-                    let mut o1 = [0.0f32; PACKET];
-                    let mut o2 = [0.0f32; PACKET];
-                    let mut o3 = [0.0f32; PACKET];
-                    if let Some(image) = images.get(usize::from(index)).and_then(Option::as_ref) {
-                        if !bilinear {
-                            let w = image.width() as f32;
-                            let h = image.height() as f32;
-                            for k in 0..count {
-                                let p = image.get((vu[k] * w).floor() as i64, (vv[k] * h).floor() as i64, tile);
-                                o0[k] = p[0];
-                                o1[k] = p[1];
-                                o2[k] = p[2];
-                                o3[k] = p[3];
-                            }
-                        } else {
-                            for k in 0..count {
-                                let p = image.sample_stored(vu[k], vv[k], tile);
-                                o0[k] = p[0];
-                                o1[k] = p[1];
-                                o2[k] = p[2];
-                                o3[k] = p[3];
-                            }
-                        }
-                    }
-                    *rf.get_mut(usize::from(dst[0])).ok_or("invalid reg")? = o0;
-                    *rf.get_mut(usize::from(dst[1])).ok_or("invalid reg")? = o1;
-                    *rf.get_mut(usize::from(dst[2])).ok_or("invalid reg")? = o2;
-                    *rf.get_mut(usize::from(dst[3])).ok_or("invalid reg")? = o3;
+                    let vu = rf[usize::from(u)];
+                    let vv = rf[usize::from(v)];
+                    let [o0, o1, o2, o3] = match images.get(usize::from(index)).and_then(Option::as_ref) {
+                        Some(image) => sample_col_packet(image, vu, vv, tile, bilinear, count),
+                        None => [[0.0f32; PACKET]; 4],
+                    };
+                    rf[usize::from(dst[0])] = o0;
+                    rf[usize::from(dst[1])] = o1;
+                    rf[usize::from(dst[2])] = o2;
+                    rf[usize::from(dst[3])] = o3;
                 }
             }
         }
@@ -1339,19 +1296,19 @@ impl FastProgram {
         match self.output.kind {
             RegKind::Float => {
                 for c in 0..dims {
-                    lanes[c] = *rf.get(usize::from(self.output.slots[c])).ok_or("missing output")?;
+                    lanes[c] = rf[usize::from(self.output.slots[c])];
                 }
             }
             RegKind::Int => {
                 for c in 0..dims {
-                    let iv = *ri.get(usize::from(self.output.slots[c])).ok_or("missing output")?;
+                    let iv = ri[usize::from(self.output.slots[c])];
                     for k in 0..count {
                         lanes[c][k] = iv[k] as f32;
                     }
                 }
             }
             RegKind::Bool => {
-                let bv = *rb.get(usize::from(self.output.slots[0])).ok_or("missing output")?;
+                let bv = rb[usize::from(self.output.slots[0])];
                 for k in 0..count {
                     lanes[0][k] = if bv[k] { 1.0 } else { 0.0 };
                 }
@@ -1561,6 +1518,730 @@ fn eliminate_dead_ops(ops: &[PacketOp], output: RegRef, n_f: usize, n_i: usize, 
     ops.iter().zip(keep).filter_map(|(&op, k)| k.then_some(op)).collect()
 }
 
+/// Branchless IEEE-754 exact `floor` over 8 lanes: avoids scalar CRT `floorf` calls on baseline x86-64.
+#[inline(always)]
+fn floor_simd8(va: [f32; PACKET]) -> [f32; PACKET] {
+    // All finite f32 values with |x| >= 2^23 are already exact integers
+    const INT_LIMIT: f32 = 8_388_608.0;
+    let mut out = [0.0f32; PACKET];
+    for k in 0..PACKET {
+        let x = va[k];
+        let in_range = x.abs() < INT_LIMIT && x != 0.0;
+        let safe = if in_range { x } else { 0.0 };
+        let t = (safe as i32) as f32;
+        let adj = if t > safe { 1.0 } else { 0.0 };
+        out[k] = if in_range { t - adj } else { x };
+    }
+    out
+}
+
+/// Branchless IEEE-754 exact `ceil` over 8 lanes: avoids scalar CRT `ceilf` calls on baseline x86-64.
+#[inline(always)]
+fn ceil_simd8(va: [f32; PACKET]) -> [f32; PACKET] {
+    const INT_LIMIT: f32 = 8_388_608.0;
+    let mut out = [0.0f32; PACKET];
+    for k in 0..PACKET {
+        let x = va[k];
+        let in_range = x.abs() < INT_LIMIT && x != 0.0;
+        let safe = if in_range { x } else { 0.0 };
+        let t = (safe as i32) as f32;
+        let adj = if t < safe { 1.0 } else { 0.0 };
+        out[k] = if in_range { (t + adj).copysign(x) } else { x };
+    }
+    out
+}
+
+/// Branchless IEEE-754 exact `x - floor(x)` over 8 lanes.
+#[inline(always)]
+fn fract_simd8(va: [f32; PACKET]) -> [f32; PACKET] {
+    let fl = floor_simd8(va);
+    let mut out = [0.0f32; PACKET];
+    for k in 0..PACKET {
+        out[k] = va[k] - fl[k];
+    }
+    out
+}
+
+/// Fast power-of-two tiled sampling for luminance, bit-identical to `image.sample_stored(...)[0]`.
+#[inline]
+fn sample_lum_packet(image: &craft_texture::Image, vu: [f32; PACKET], vv: [f32; PACKET], tile: bool, bilinear: bool, count: usize) -> [f32; PACKET] {
+    let mut out = [0.0f32; PACKET];
+    let w = image.width() as usize;
+    let h = image.height() as usize;
+    let data = image.data();
+    let ch = image.channels();
+    if tile && w.is_power_of_two() && h.is_power_of_two() && data.len() == w * h * ch {
+        let wm = w - 1;
+        let hm = h - 1;
+        let wf = w as f32;
+        let hf = h as f32;
+        if !bilinear {
+            for k in 0..count {
+                let (u, v) = (vu[k], vv[k]);
+                if !u.is_finite() || !v.is_finite() {
+                    out[k] = image.get((u * wf).floor() as i64, (v * hf).floor() as i64, tile)[0];
+                    continue;
+                }
+                let ix = ((u * wf).floor() as i64 as usize) & wm;
+                let iy = ((v * hf).floor() as i64 as usize) & hm;
+                out[k] = data[(iy * w + ix) * ch];
+            }
+            return out;
+        }
+        let int_samp = image.integer_sampling();
+        for k in 0..count {
+            let (u, v) = (vu[k], vv[k]);
+            if !u.is_finite() || !v.is_finite() {
+                out[k] = 0.0;
+                continue;
+            }
+            let ru = u - u.floor();
+            let rv = v - v.floor();
+            let fx = ru * wf - 0.5;
+            let fy = rv * hf - 0.5;
+            let x0 = fx.floor();
+            let y0 = fy.floor();
+            let tx = ((fx - x0) * 256.0).round() * (1.0 / 256.0);
+            let ty = ((fy - y0) * 256.0).round() * (1.0 / 256.0);
+            let ix0 = (x0 as isize as usize) & wm;
+            let ix1 = (ix0 + 1) & wm;
+            let iy0 = (y0 as isize as usize) & hm;
+            let iy1 = (iy0 + 1) & hm;
+            let a = data[(iy0 * w + ix0) * ch];
+            let b = data[(iy0 * w + ix1) * ch];
+            let c = data[(iy1 * w + ix0) * ch];
+            let d = data[(iy1 * w + ix1) * ch];
+            let top = a + (b - a) * tx;
+            let bot = c + (d - c) * tx;
+            let val = top + (bot - top) * ty;
+            if !val.is_finite() {
+                out[k] = image.sample_stored(u, v, tile)[0];
+            } else if int_samp {
+                out[k] = (val.clamp(0.0, 1.0) * 65535.0).round() / 65535.0;
+            } else {
+                out[k] = val;
+            }
+        }
+        return out;
+    }
+
+    if !bilinear {
+        let wf = w as f32;
+        let hf = h as f32;
+        for k in 0..count {
+            out[k] = image.get((vu[k] * wf).floor() as i64, (vv[k] * hf).floor() as i64, tile)[0];
+        }
+    } else {
+        for k in 0..count {
+            out[k] = image.sample_stored(vu[k], vv[k], tile)[0];
+        }
+    }
+    out
+}
+
+/// Fast power-of-two tiled sampling for RGBA, bit-identical to `image.sample_stored(...)`.
+#[inline]
+fn sample_col_packet(image: &craft_texture::Image, vu: [f32; PACKET], vv: [f32; PACKET], tile: bool, bilinear: bool, count: usize) -> [[f32; PACKET]; 4] {
+    let mut out = [[0.0f32; PACKET]; 4];
+    let w = image.width() as usize;
+    let h = image.height() as usize;
+    let data = image.data();
+    let ch = image.channels();
+    if tile && w.is_power_of_two() && h.is_power_of_two() && data.len() == w * h * ch {
+        let wm = w - 1;
+        let hm = h - 1;
+        let wf = w as f32;
+        let hf = h as f32;
+        let int_samp = image.integer_sampling();
+        if !bilinear {
+            for k in 0..count {
+                let (u, v) = (vu[k], vv[k]);
+                if !u.is_finite() || !v.is_finite() {
+                    let p = image.get((u * wf).floor() as i64, (v * hf).floor() as i64, tile);
+                    for c in 0..4 {
+                        out[c][k] = p[c];
+                    }
+                    continue;
+                }
+                let ix = ((u * wf).floor() as i64 as usize) & wm;
+                let iy = ((v * hf).floor() as i64 as usize) & hm;
+                let base = (iy * w + ix) * ch;
+                if ch == 1 {
+                    let g = data[base];
+                    out[0][k] = g;
+                    out[1][k] = g;
+                    out[2][k] = g;
+                    out[3][k] = 1.0;
+                } else {
+                    out[0][k] = data[base];
+                    out[1][k] = data[base + 1];
+                    out[2][k] = data[base + 2];
+                    out[3][k] = data[base + 3];
+                }
+            }
+            return out;
+        }
+        for k in 0..count {
+            let (u, v) = (vu[k], vv[k]);
+            if !u.is_finite() || !v.is_finite() {
+                out[3][k] = 1.0;
+                continue;
+            }
+            let ru = u - u.floor();
+            let rv = v - v.floor();
+            let fx = ru * wf - 0.5;
+            let fy = rv * hf - 0.5;
+            let x0 = fx.floor();
+            let y0 = fy.floor();
+            let tx = ((fx - x0) * 256.0).round() * (1.0 / 256.0);
+            let ty = ((fy - y0) * 256.0).round() * (1.0 / 256.0);
+            let ix0 = (x0 as isize as usize) & wm;
+            let ix1 = (ix0 + 1) & wm;
+            let iy0 = (y0 as isize as usize) & hm;
+            let iy1 = (iy0 + 1) & hm;
+            if ch == 1 {
+                let a = data[iy0 * w + ix0];
+                let b = data[iy0 * w + ix1];
+                let c = data[iy1 * w + ix0];
+                let d = data[iy1 * w + ix1];
+                let top = a + (b - a) * tx;
+                let bot = c + (d - c) * tx;
+                let val = top + (bot - top) * ty;
+                if !val.is_finite() {
+                    let p = image.sample_stored(u, v, tile);
+                    for ch_i in 0..4 {
+                        out[ch_i][k] = p[ch_i];
+                    }
+                } else {
+                    let g = if int_samp { (val.clamp(0.0, 1.0) * 65535.0).round() / 65535.0 } else { val };
+                    out[0][k] = g;
+                    out[1][k] = g;
+                    out[2][k] = g;
+                    out[3][k] = 1.0;
+                }
+            } else {
+                let ia = (iy0 * w + ix0) * 4;
+                let ib = (iy0 * w + ix1) * 4;
+                let ic = (iy1 * w + ix0) * 4;
+                let id = (iy1 * w + ix1) * 4;
+                let mut fallback = false;
+                let mut px = [0.0f32; 4];
+                for ch_i in 0..4 {
+                    let top = data[ia + ch_i] + (data[ib + ch_i] - data[ia + ch_i]) * tx;
+                    let bot = data[ic + ch_i] + (data[id + ch_i] - data[ic + ch_i]) * tx;
+                    let val = top + (bot - top) * ty;
+                    if !val.is_finite() {
+                        fallback = true;
+                        break;
+                    }
+                    px[ch_i] = if int_samp { (val.clamp(0.0, 1.0) * 65535.0).round() / 65535.0 } else { val };
+                }
+                if fallback {
+                    px = image.sample_stored(u, v, tile);
+                }
+                for ch_i in 0..4 {
+                    out[ch_i][k] = px[ch_i];
+                }
+            }
+        }
+        return out;
+    }
+
+    if !bilinear {
+        let wf = w as f32;
+        let hf = h as f32;
+        for k in 0..count {
+            let p = image.get((vu[k] * wf).floor() as i64, (vv[k] * hf).floor() as i64, tile);
+            for ch_i in 0..4 {
+                out[ch_i][k] = p[ch_i];
+            }
+        }
+    } else {
+        for k in 0..count {
+            let p = image.sample_stored(vu[k], vv[k], tile);
+            for ch_i in 0..4 {
+                out[ch_i][k] = p[ch_i];
+            }
+        }
+    }
+    out
+}
+
+/// Linear-scan register compaction: keeps only live constants/inputs pinned and reuses dead dynamic
+/// register slots so large 4,000-node pixel processors stay L1-cache resident (~1–4 KB vs ~120 KB).
+#[allow(clippy::too_many_arguments)]
+fn compact_and_allocate_regs(
+    ops: Vec<PacketOp>,
+    f_init: &[f32],
+    f_const: &[Option<f32>],
+    i_init: &[i32],
+    i_const: &[Option<i32>],
+    b_init: &[bool],
+    b_const: &[Option<bool>],
+    pos_x: u16,
+    pos_y: u16,
+    output: RegRef,
+) -> Option<FastProgram> {
+    let n_ops = ops.len();
+    let mut last_f = vec![None::<usize>; f_init.len()];
+    let mut last_i = vec![None::<usize>; i_init.len()];
+    let mut last_b = vec![None::<usize>; b_init.len()];
+
+    let bump = |v: &mut [Option<usize>], slot: u16, at: usize| {
+        if let Some(entry) = v.get_mut(usize::from(slot)) {
+            *entry = Some(entry.map_or(at, |prev| prev.max(at)));
+        }
+    };
+
+    for (idx, &op) in ops.iter().enumerate() {
+        visit_op_uses(op, |s| bump(&mut last_f, s, idx), |s| bump(&mut last_i, s, idx), |s| bump(&mut last_b, s, idx));
+    }
+    for c in 0..usize::from(output.dims) {
+        let s = output.slots[c];
+        match output.kind {
+            RegKind::Float => bump(&mut last_f, s, n_ops),
+            RegKind::Int => bump(&mut last_i, s, n_ops),
+            RegKind::Bool => bump(&mut last_b, s, n_ops),
+        }
+    }
+
+    let mut map_f = vec![None::<u16>; f_init.len()];
+    let mut map_i = vec![None::<u16>; i_init.len()];
+    let mut map_b = vec![None::<u16>; b_init.len()];
+    let mut new_f_init = Vec::new();
+    let mut new_i_init = Vec::new();
+    let mut new_b_init = Vec::new();
+
+    // Pin pos_x and pos_y first (always written at packet entry)
+    let new_pos_x = u16::try_from(new_f_init.len()).ok()?;
+    new_f_init.push(0.0);
+    *map_f.get_mut(usize::from(pos_x))? = Some(new_pos_x);
+    let new_pos_y = u16::try_from(new_f_init.len()).ok()?;
+    new_f_init.push(0.0);
+    *map_f.get_mut(usize::from(pos_y))? = Some(new_pos_y);
+
+    // Pin only constants that are actually read
+    for (vreg, &val) in f_const.iter().enumerate() {
+        if let Some(c) = val
+            && last_f.get(vreg).copied().flatten().is_some()
+        {
+            let phys = u16::try_from(new_f_init.len()).ok()?;
+            new_f_init.push(c);
+            *map_f.get_mut(vreg)? = Some(phys);
+        }
+    }
+    for (vreg, &val) in i_const.iter().enumerate() {
+        if let Some(c) = val
+            && last_i.get(vreg).copied().flatten().is_some()
+        {
+            let phys = u16::try_from(new_i_init.len()).ok()?;
+            new_i_init.push(c);
+            *map_i.get_mut(vreg)? = Some(phys);
+        }
+    }
+    for (vreg, &val) in b_const.iter().enumerate() {
+        if let Some(c) = val
+            && last_b.get(vreg).copied().flatten().is_some()
+        {
+            let phys = u16::try_from(new_b_init.len()).ok()?;
+            new_b_init.push(c);
+            *map_b.get_mut(vreg)? = Some(phys);
+        }
+    }
+
+    let pinned_f = new_f_init.len() as u16;
+    let pinned_i = new_i_init.len() as u16;
+    let pinned_b = new_b_init.len() as u16;
+
+    let mut free_f: Vec<u16> = Vec::new();
+    let mut free_i: Vec<u16> = Vec::new();
+    let mut free_b: Vec<u16> = Vec::new();
+
+    let mut rewritten = Vec::with_capacity(n_ops);
+    let mut dying_f = Vec::with_capacity(4);
+    let mut dying_i = Vec::with_capacity(4);
+    let mut dying_b = Vec::with_capacity(4);
+
+    for (idx, op) in ops.into_iter().enumerate() {
+        dying_f.clear();
+        dying_i.clear();
+        dying_b.clear();
+
+        // Collect dynamic source registers whose last use is this op (freed AFTER allocating dst)
+        visit_op_uses(
+            op,
+            |s| {
+                if last_f.get(usize::from(s)).copied().flatten() == Some(idx)
+                    && let Some(phys) = map_f.get(usize::from(s)).copied().flatten()
+                    && phys >= pinned_f
+                    && !dying_f.contains(&phys)
+                {
+                    dying_f.push(phys);
+                }
+            },
+            |s| {
+                if last_i.get(usize::from(s)).copied().flatten() == Some(idx)
+                    && let Some(phys) = map_i.get(usize::from(s)).copied().flatten()
+                    && phys >= pinned_i
+                    && !dying_i.contains(&phys)
+                {
+                    dying_i.push(phys);
+                }
+            },
+            |s| {
+                if last_b.get(usize::from(s)).copied().flatten() == Some(idx)
+                    && let Some(phys) = map_b.get(usize::from(s)).copied().flatten()
+                    && phys >= pinned_b
+                    && !dying_b.contains(&phys)
+                {
+                    dying_b.push(phys);
+                }
+            },
+        );
+
+        let lookup = |map: &[Option<u16>], s: u16| map.get(usize::from(s)).copied().flatten();
+        let alloc_def = |vreg: u16,
+                         map: &mut [Option<u16>],
+                         free: &mut Vec<u16>,
+                         last: &[Option<usize>],
+                         dying: &mut Vec<u16>,
+                         len: &mut usize,
+                         push: &mut dyn FnMut()|
+         -> Option<u16> {
+            let phys = if let Some(slot) = free.pop() {
+                slot
+            } else {
+                let slot = u16::try_from(*len).ok()?;
+                *len += 1;
+                push();
+                slot
+            };
+            *map.get_mut(usize::from(vreg))? = Some(phys);
+            if last.get(usize::from(vreg)).copied().flatten().is_none() {
+                dying.push(phys);
+            }
+            Some(phys)
+        };
+
+        let mut f_len = new_f_init.len();
+        let mut i_len = new_i_init.len();
+        let mut b_len = new_b_init.len();
+        let mut push_f = || new_f_init.push(0.0);
+        let mut push_i = || new_i_init.push(0);
+        let mut push_b = || new_b_init.push(false);
+
+        macro_rules! def_f {
+            ($v:expr) => {
+                alloc_def($v, &mut map_f, &mut free_f, &last_f, &mut dying_f, &mut f_len, &mut push_f)?
+            };
+        }
+        macro_rules! def_i {
+            ($v:expr) => {
+                alloc_def($v, &mut map_i, &mut free_i, &last_i, &mut dying_i, &mut i_len, &mut push_i)?
+            };
+        }
+        macro_rules! def_b {
+            ($v:expr) => {
+                alloc_def($v, &mut map_b, &mut free_b, &last_b, &mut dying_b, &mut b_len, &mut push_b)?
+            };
+        }
+
+        let new_op = match op {
+            PacketOp::NegF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::NegF { a, dst: def_f!(dst) }
+            }
+            PacketOp::AbsF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::AbsF { a, dst: def_f!(dst) }
+            }
+            PacketOp::FloorF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::FloorF { a, dst: def_f!(dst) }
+            }
+            PacketOp::FractF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::FractF { a, dst: def_f!(dst) }
+            }
+            PacketOp::CeilF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::CeilF { a, dst: def_f!(dst) }
+            }
+            PacketOp::SqrtF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::SqrtF { a, dst: def_f!(dst) }
+            }
+            PacketOp::ExpF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::ExpF { a, dst: def_f!(dst) }
+            }
+            PacketOp::LogF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::LogF { a, dst: def_f!(dst) }
+            }
+            PacketOp::Log2F { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::Log2F { a, dst: def_f!(dst) }
+            }
+            PacketOp::Pow2F { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::Pow2F { a, dst: def_f!(dst) }
+            }
+            PacketOp::SinF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::SinF { a, dst: def_f!(dst) }
+            }
+            PacketOp::CosF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::CosF { a, dst: def_f!(dst) }
+            }
+            PacketOp::TanF { dst, a } => {
+                let a = lookup(&map_f, a)?;
+                PacketOp::TanF { a, dst: def_f!(dst) }
+            }
+            PacketOp::AddF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::AddF { a, b, dst: def_f!(dst) }
+            }
+            PacketOp::SubF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::SubF { a, b, dst: def_f!(dst) }
+            }
+            PacketOp::MulF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::MulF { a, b, dst: def_f!(dst) }
+            }
+            PacketOp::DivF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::DivF { a, b, dst: def_f!(dst) }
+            }
+            PacketOp::ModF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::ModF { a, b, dst: def_f!(dst) }
+            }
+            PacketOp::MinF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::MinF { a, b, dst: def_f!(dst) }
+            }
+            PacketOp::MaxF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::MaxF { a, b, dst: def_f!(dst) }
+            }
+            PacketOp::PowF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::PowF { a, b, dst: def_f!(dst) }
+            }
+            PacketOp::Atan2F { dst, y, x } => {
+                let (y, x) = (lookup(&map_f, y)?, lookup(&map_f, x)?);
+                PacketOp::Atan2F { y, x, dst: def_f!(dst) }
+            }
+            PacketOp::CartesianF { dst_x, dst_y, r, ang } => {
+                let (r, ang) = (lookup(&map_f, r)?, lookup(&map_f, ang)?);
+                PacketOp::CartesianF { r, ang, dst_x: def_f!(dst_x), dst_y: def_f!(dst_y) }
+            }
+            PacketOp::LerpF { dst, a, b, t } => {
+                let (a, b, t) = (lookup(&map_f, a)?, lookup(&map_f, b)?, lookup(&map_f, t)?);
+                PacketOp::LerpF { a, b, t, dst: def_f!(dst) }
+            }
+            PacketOp::EqF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::EqF { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::EqI { dst, a, b } => {
+                let (a, b) = (lookup(&map_i, a)?, lookup(&map_i, b)?);
+                PacketOp::EqI { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::EqB { dst, a, b } => {
+                let (a, b) = (lookup(&map_b, a)?, lookup(&map_b, b)?);
+                PacketOp::EqB { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::GtF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::GtF { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::GtEqF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::GtEqF { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::LrF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::LrF { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::LrEqF { dst, a, b } => {
+                let (a, b) = (lookup(&map_f, a)?, lookup(&map_f, b)?);
+                PacketOp::LrEqF { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::GtI { dst, a, b } => {
+                let (a, b) = (lookup(&map_i, a)?, lookup(&map_i, b)?);
+                PacketOp::GtI { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::GtEqI { dst, a, b } => {
+                let (a, b) = (lookup(&map_i, a)?, lookup(&map_i, b)?);
+                PacketOp::GtEqI { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::LrI { dst, a, b } => {
+                let (a, b) = (lookup(&map_i, a)?, lookup(&map_i, b)?);
+                PacketOp::LrI { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::LrEqI { dst, a, b } => {
+                let (a, b) = (lookup(&map_i, a)?, lookup(&map_i, b)?);
+                PacketOp::LrEqI { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::MinI { dst, a, b } => {
+                let (a, b) = (lookup(&map_i, a)?, lookup(&map_i, b)?);
+                PacketOp::MinI { a, b, dst: def_i!(dst) }
+            }
+            PacketOp::MaxI { dst, a, b } => {
+                let (a, b) = (lookup(&map_i, a)?, lookup(&map_i, b)?);
+                PacketOp::MaxI { a, b, dst: def_i!(dst) }
+            }
+            PacketOp::IntToFloat { dst, a } => {
+                let a = lookup(&map_i, a)?;
+                PacketOp::IntToFloat { a, dst: def_f!(dst) }
+            }
+            PacketOp::And { dst, a, b } => {
+                let (a, b) = (lookup(&map_b, a)?, lookup(&map_b, b)?);
+                PacketOp::And { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::Or { dst, a, b } => {
+                let (a, b) = (lookup(&map_b, a)?, lookup(&map_b, b)?);
+                PacketOp::Or { a, b, dst: def_b!(dst) }
+            }
+            PacketOp::Not { dst, a } => {
+                let a = lookup(&map_b, a)?;
+                PacketOp::Not { a, dst: def_b!(dst) }
+            }
+            PacketOp::SelectF { dst, c, t, e } => {
+                let (c, t, e) = (lookup(&map_b, c)?, lookup(&map_f, t)?, lookup(&map_f, e)?);
+                PacketOp::SelectF { c, t, e, dst: def_f!(dst) }
+            }
+            PacketOp::SelectI { dst, c, t, e } => {
+                let (c, t, e) = (lookup(&map_b, c)?, lookup(&map_i, t)?, lookup(&map_i, e)?);
+                PacketOp::SelectI { c, t, e, dst: def_i!(dst) }
+            }
+            PacketOp::SelectB { dst, c, t, e } => {
+                let (c, t, e) = (lookup(&map_b, c)?, lookup(&map_b, t)?, lookup(&map_b, e)?);
+                PacketOp::SelectB { c, t, e, dst: def_b!(dst) }
+            }
+            PacketOp::SampleLum { dst, u, v, index, bilinear } => {
+                let (u, v) = (lookup(&map_f, u)?, lookup(&map_f, v)?);
+                PacketOp::SampleLum { u, v, dst: def_f!(dst), index, bilinear }
+            }
+            PacketOp::SampleCol { dst, u, v, index, bilinear } => {
+                let (u, v) = (lookup(&map_f, u)?, lookup(&map_f, v)?);
+                PacketOp::SampleCol { u, v, dst: [def_f!(dst[0]), def_f!(dst[1]), def_f!(dst[2]), def_f!(dst[3])], index, bilinear }
+            }
+        };
+        rewritten.push(new_op);
+
+        free_f.extend_from_slice(&dying_f);
+        free_i.extend_from_slice(&dying_i);
+        free_b.extend_from_slice(&dying_b);
+    }
+
+    let mut out_slots = [0u16; 4];
+    for c in 0..usize::from(output.dims) {
+        let s = output.slots[c];
+        out_slots[c] = match output.kind {
+            RegKind::Float => map_f.get(usize::from(s)).copied().flatten()?,
+            RegKind::Int => map_i.get(usize::from(s)).copied().flatten()?,
+            RegKind::Bool => map_b.get(usize::from(s)).copied().flatten()?,
+        };
+    }
+
+    Some(FastProgram {
+        ops: rewritten,
+        f_init: new_f_init,
+        i_init: new_i_init,
+        b_init: new_b_init,
+        pos_x: new_pos_x,
+        pos_y: new_pos_y,
+        output: RegRef { kind: output.kind, dims: output.dims, slots: out_slots },
+    })
+}
+
+fn visit_op_uses(op: PacketOp, mut use_f: impl FnMut(u16), mut use_i: impl FnMut(u16), mut use_b: impl FnMut(u16)) {
+    match op {
+        PacketOp::NegF { a, .. }
+        | PacketOp::AbsF { a, .. }
+        | PacketOp::FloorF { a, .. }
+        | PacketOp::FractF { a, .. }
+        | PacketOp::CeilF { a, .. }
+        | PacketOp::SqrtF { a, .. }
+        | PacketOp::ExpF { a, .. }
+        | PacketOp::LogF { a, .. }
+        | PacketOp::Log2F { a, .. }
+        | PacketOp::Pow2F { a, .. }
+        | PacketOp::SinF { a, .. }
+        | PacketOp::CosF { a, .. }
+        | PacketOp::TanF { a, .. } => use_f(a),
+        PacketOp::AddF { a, b, .. }
+        | PacketOp::SubF { a, b, .. }
+        | PacketOp::MulF { a, b, .. }
+        | PacketOp::DivF { a, b, .. }
+        | PacketOp::ModF { a, b, .. }
+        | PacketOp::MinF { a, b, .. }
+        | PacketOp::MaxF { a, b, .. }
+        | PacketOp::PowF { a, b, .. }
+        | PacketOp::EqF { a, b, .. }
+        | PacketOp::GtF { a, b, .. }
+        | PacketOp::GtEqF { a, b, .. }
+        | PacketOp::LrF { a, b, .. }
+        | PacketOp::LrEqF { a, b, .. } => {
+            use_f(a);
+            use_f(b);
+        }
+        PacketOp::Atan2F { y, x, .. } => {
+            use_f(y);
+            use_f(x);
+        }
+        PacketOp::CartesianF { r, ang, .. } => {
+            use_f(r);
+            use_f(ang);
+        }
+        PacketOp::LerpF { a, b, t, .. } => {
+            use_f(a);
+            use_f(b);
+            use_f(t);
+        }
+        PacketOp::EqI { a, b, .. }
+        | PacketOp::GtI { a, b, .. }
+        | PacketOp::GtEqI { a, b, .. }
+        | PacketOp::LrI { a, b, .. }
+        | PacketOp::LrEqI { a, b, .. }
+        | PacketOp::MinI { a, b, .. }
+        | PacketOp::MaxI { a, b, .. } => {
+            use_i(a);
+            use_i(b);
+        }
+        PacketOp::IntToFloat { a, .. } => use_i(a),
+        PacketOp::EqB { a, b, .. } | PacketOp::And { a, b, .. } | PacketOp::Or { a, b, .. } => {
+            use_b(a);
+            use_b(b);
+        }
+        PacketOp::Not { a, .. } => use_b(a),
+        PacketOp::SelectF { c, t, e, .. } => {
+            use_b(c);
+            use_f(t);
+            use_f(e);
+        }
+        PacketOp::SelectI { c, t, e, .. } => {
+            use_b(c);
+            use_i(t);
+            use_i(e);
+        }
+        PacketOp::SelectB { c, t, e, .. } => {
+            use_b(c);
+            use_b(t);
+            use_b(e);
+        }
+        PacketOp::SampleLum { u, v, .. } | PacketOp::SampleCol { u, v, .. } => {
+            use_f(u);
+            use_f(v);
+        }
+    }
+}
+
 /// Auto-vectorizable 8-wide Cody-Waite + Cephes minimax `sin` (max error < 3e-7 for |x| <= 4096).
 /// Range fallback is per-lane so no pixel's result depends on its packet neighbors, and `-0.0`
 /// preserves its sign bit.
@@ -1623,8 +2304,11 @@ fn trig_simd8(va: [f32; PACKET], quad_offset: i32) -> [f32; PACKET] {
     let mut out = [0.0f32; PACKET];
     for k in 0..PACKET {
         let x = va[k];
-        let q = (x * TWO_OVER_PI).round();
-        let qi = q as i32 + quad_offset;
+        // |x| <= 4096 guarantees |z| <= 2608; branchless nearest-int avoids scalar CRT roundf
+        let z = x * TWO_OVER_PI;
+        let qi_base = (if z >= 0.0 { z + 0.5 } else { z - 0.5 }) as i32;
+        let q = qi_base as f32;
+        let qi = qi_base + quad_offset;
         let r = ((x - q * PI_2_HI) - q * PI_2_MID) - q * PI_2_LO;
         let r2 = r * r;
         let s = r + r * r2 * (-1.666_665_5e-1 + r2 * (8.332_161e-3 + r2 * -1.951_529_6e-4));
@@ -1922,5 +2606,79 @@ mod tests {
         let s = sin_simd8(zeros);
         assert_eq!(s[0].to_bits(), (-0.0f32).to_bits());
         assert_eq!(s[1].to_bits(), (0.0f32).to_bits());
+    }
+
+    #[test]
+    fn simd8_floor_ceil_fract_are_bit_exact() {
+        let samples: [f32; 16] = [
+            -0.0,
+            0.0,
+            -0.5,
+            0.5,
+            -1.0,
+            1.0,
+            -1.0001,
+            1.9999,
+            -8_388_607.5,
+            8_388_607.5,
+            -8_388_608.0,
+            8_388_608.0,
+            -1.0e20,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        for &v in samples.as_chunks::<PACKET>().0 {
+            let fl = floor_simd8(v);
+            let cl = ceil_simd8(v);
+            let fr = fract_simd8(v);
+            for k in 0..PACKET {
+                let x = v[k];
+                if x.is_nan() {
+                    assert!(fl[k].is_nan() && cl[k].is_nan() && fr[k].is_nan());
+                } else {
+                    assert_eq!(fl[k].to_bits(), x.floor().to_bits(), "floor({x})");
+                    assert_eq!(cl[k].to_bits(), x.ceil().to_bits(), "ceil({x})");
+                    let exp_fr = x - x.floor();
+                    if exp_fr.is_nan() {
+                        assert!(fr[k].is_nan(), "fract({x})");
+                    } else {
+                        assert_eq!(fr[k].to_bits(), exp_fr.to_bits(), "fract({x})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn linear_scan_compaction_reuses_dead_registers_and_matches_sampling() {
+        // Build a long chain of 60 ops so SSA would need >60 float regs, while liveness peak is tiny
+        let mut nodes = vec![
+            n(1, "get_float2", &[], Some(Value::Text("$pos".into()))),
+            n(2, "swizzle1", &[1], Some(Value::Int(0))),
+            n(3, "const_float1", &[], Some(Value::Float(1.005))),
+        ];
+        let mut prev = 2u32;
+        for next_id in 4u32..64 {
+            nodes.push(n(next_id, "mul", &[prev, 3], None));
+            prev = next_id;
+        }
+        let graph = FunctionGraph { nodes, output: Some(prev), ..FunctionGraph::default() };
+        let prog = compile(&graph, 0).expect("compile");
+        let fast = FastProgram::try_compile(&prog, &BTreeMap::new(), [16.0, 16.0], true).expect("fast");
+        assert!(fast.f_init.len() <= 8, "expected register reuse, got {} float regs", fast.f_init.len());
+
+        let img = craft_texture::Image::gray(16, 16, |x, y| ((x * 7 + y * 13) % 16) as f32 / 15.0).with_integer_sampling(true);
+        let vu = [-0.25, 0.0, 0.125, 0.333, 0.5, 0.777, 1.0, 1.875];
+        let vv = [0.0, 0.1, 0.25, 0.5, 0.666, 0.99, 1.25, -0.5];
+        let lum = sample_lum_packet(&img, vu, vv, true, true, PACKET);
+        let col = sample_col_packet(&img, vu, vv, true, true, PACKET);
+        for k in 0..PACKET {
+            let expected = img.sample_stored(vu[k], vv[k], true);
+            assert_eq!(lum[k].to_bits(), expected[0].to_bits());
+            for c in 0..4 {
+                assert_eq!(col[c][k].to_bits(), expected[c].to_bits());
+            }
+        }
     }
 }
