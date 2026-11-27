@@ -309,6 +309,9 @@ impl Headless {
 
     /// Render the assigned material or a node output as PNG, honouring an optional cancellation flag.
     pub fn render_png_with_cancel(&mut self, o: &RenderOptions, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Rendered, AutomationError> {
+        if is_cancelled(cancel) {
+            return Err(AutomationError::Other("render cancelled".into()));
+        }
         let max = if self.trusted() { MAX_LOCAL_RENDER_SIDE } else { MAX_PNG_SIDE };
         let view = o.view.as_deref().unwrap_or("3d");
         let out = match view {
@@ -367,7 +370,7 @@ impl Headless {
         let cached_hit = self.full_cache_matches(graph) && self.full_cache.as_ref().is_some_and(|c| c.cooked.image(target_id, port).is_some());
         if !cached_hit {
             let partial = self.session.cook_full_with(graph, Some(vec![target_id]), cancel);
-            if partial.cancelled {
+            if partial.cancelled || is_cancelled(cancel) {
                 return Err(AutomationError::Other("render cancelled".into()));
             }
             if self.full_cache_matches(graph)
@@ -410,7 +413,7 @@ impl Headless {
         let cached_hit = self.full_cache_matches(graph) && self.full_cache.as_ref().is_some_and(|c| c.complete);
         if !cached_hit {
             let full = self.session.cook_full_with(graph, None, cancel);
-            if full.cancelled {
+            if full.cancelled || is_cancelled(cancel) {
                 return Err(AutomationError::Other("render cancelled".into()));
             }
             self.full_cache = Some(FullCache { document_id: doc_id, graph, session_revision: s_rev, headless_revision: rev, complete: true, cooked: full });
@@ -428,7 +431,7 @@ impl Headless {
         let mut extra_cooked = std::collections::BTreeMap::new();
         for (other_graph, nodes) in cross_graph_nodes {
             let cooked = self.session.cook_full_with(other_graph, Some(nodes), cancel);
-            if cooked.cancelled {
+            if cooked.cancelled || is_cancelled(cancel) {
                 return Err(AutomationError::Other("render cancelled".into()));
             }
             extra_cooked.insert(other_graph, cooked);
@@ -496,6 +499,10 @@ impl Headless {
         }
         (w, h, materialcraft_render::render(displaced.as_ref().unwrap_or(scene), &maps, light, &settings, w, h))
     }
+}
+
+fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn render_2d_image(image: &materialcraft_engine::image::Image, options: &RenderOptions, maximum_side: u32) -> Result<(u32, u32, Vec<u8>), AutomationError> {

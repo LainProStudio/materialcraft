@@ -159,4 +159,19 @@ mod end_merge_tests {
         let cross_graph_png = h.render_png(&opts).unwrap().png;
         assert_ne!(cross_graph_png, dark_png, "cross-graph channel must be cooked at full resolution, not silently dropped");
     }
+
+    #[test]
+    fn render_png_with_cancel_rejects_preset_cancel_even_on_cache_hit() {
+        let mut h = Headless::new(materialcraft_engine::new_session(), Filesystem::Denied);
+        h.command_run("file.new", json!({"template": "pbr", "name": "Mat", "size": 32})).unwrap();
+        let opts_2d = RenderOptions { view: Some("2d".into()), width: Some(16), height: Some(16), full: true, ..RenderOptions::default() };
+        let opts_3d = RenderOptions { view: Some("3d".into()), width: Some(16), height: Some(16), full: true, ..RenderOptions::default() };
+        // Populate both caches first.
+        h.render_png(&opts_2d).unwrap();
+        h.render_png(&opts_3d).unwrap();
+        // A pre-set cancel flag must fail before returning cached renders.
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert!(h.render_png_with_cancel(&opts_2d, Some(&cancelled)).is_err());
+        assert!(h.render_png_with_cancel(&opts_3d, Some(&cancelled)).is_err());
+    }
 }
