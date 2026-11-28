@@ -1561,78 +1561,16 @@ fn eliminate_dead_ops(ops: &[PacketOp], output: RegRef, n_f: usize, n_i: usize, 
     ops.iter().zip(keep).filter_map(|(&op, k)| k.then_some(op)).collect()
 }
 
-/// Auto-vectorizable 8-wide Cody-Waite + Cephes minimax `sin` (max error < 3e-7 for |x| <= 4096).
-/// Range fallback is per-lane so no pixel's result depends on its packet neighbors, and `-0.0`
-/// preserves its sign bit.
+// Preserve the interpreter's scalar arithmetic in every lane. Polynomial approximations
+// can change stored F32 pixels even for small, finite inputs.
 #[inline]
-fn sin_simd8(va: [f32; PACKET]) -> [f32; PACKET] {
-    let mut safe = [0.0f32; PACKET];
-    let mut any_oob = false;
-    for k in 0..PACKET {
-        let x = va[k];
-        if x.is_finite() && x.abs() <= 4096.0 {
-            safe[k] = x;
-        } else {
-            any_oob = true;
-        }
-    }
-    let mut out = trig_simd8(safe, 0);
-    for k in 0..PACKET {
-        let x = va[k];
-        if x == 0.0 {
-            out[k] = x;
-        } else if any_oob && (!x.is_finite() || x.abs() > 4096.0) {
-            out[k] = x.sin();
-        }
-    }
-    out
-}
-
-/// Auto-vectorizable 8-wide Cody-Waite + Cephes minimax `cos` (max error < 3e-7 for |x| <= 4096).
-/// Range fallback is per-lane so no pixel's result depends on its packet neighbors.
-#[inline]
-fn cos_simd8(va: [f32; PACKET]) -> [f32; PACKET] {
-    let mut safe = [0.0f32; PACKET];
-    let mut any_oob = false;
-    for k in 0..PACKET {
-        let x = va[k];
-        if x.is_finite() && x.abs() <= 4096.0 {
-            safe[k] = x;
-        } else {
-            any_oob = true;
-        }
-    }
-    let mut out = trig_simd8(safe, 1);
-    if any_oob {
-        for k in 0..PACKET {
-            let x = va[k];
-            if !x.is_finite() || x.abs() > 4096.0 {
-                out[k] = x.cos();
-            }
-        }
-    }
-    out
+fn sin_simd8(values: [f32; PACKET]) -> [f32; PACKET] {
+    values.map(f32::sin)
 }
 
 #[inline]
-fn trig_simd8(va: [f32; PACKET], quad_offset: i32) -> [f32; PACKET] {
-    const TWO_OVER_PI: f32 = std::f32::consts::FRAC_2_PI;
-    const PI_2_HI: f32 = f32::from_bits(0x3fc9_0000);
-    const PI_2_MID: f32 = f32::from_bits(0x39fd_a000);
-    const PI_2_LO: f32 = f32::from_bits(0x33a2_2169);
-    let mut out = [0.0f32; PACKET];
-    for k in 0..PACKET {
-        let x = va[k];
-        let q = (x * TWO_OVER_PI).round();
-        let qi = q as i32 + quad_offset;
-        let r = ((x - q * PI_2_HI) - q * PI_2_MID) - q * PI_2_LO;
-        let r2 = r * r;
-        let s = r + r * r2 * (-1.666_665_5e-1 + r2 * (8.332_161e-3 + r2 * -1.951_529_6e-4));
-        let c = 1.0 + r2 * (-0.5 + r2 * (4.166_664_6e-2 + r2 * (-1.388_731_6e-3 + r2 * 2.443_315_7e-5)));
-        let mag = if (qi & 1) == 0 { s } else { c };
-        out[k] = if (qi & 2) != 0 { -mag } else { mag };
-    }
-    out
+fn cos_simd8(values: [f32; PACKET]) -> [f32; PACKET] {
+    values.map(f32::cos)
 }
 
 fn reg_type_code(kind: RegKind, dims: u8) -> u32 {
@@ -1695,6 +1633,17 @@ mod tests {
             source: None,
             missing: None,
             missing_data: String::new(),
+        }
+    }
+
+    #[test]
+    fn packet_trig_matches_interpreter_bits() {
+        let values = [0.095_f32, -0.095, 0.12345, -0.0, 0.0, 4096.0, 4097.0, 1.0e9];
+        let sine = sin_simd8(values);
+        let cosine = cos_simd8(values);
+        for (lane, value) in values.into_iter().enumerate() {
+            assert_eq!(sine[lane].to_bits(), value.sin().to_bits(), "sin lane {lane}");
+            assert_eq!(cosine[lane].to_bits(), value.cos().to_bits(), "cos lane {lane}");
         }
     }
 
